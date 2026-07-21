@@ -536,7 +536,7 @@ PAGE = """<!DOCTYPE html>
     
     // ====== FIX: Share this Telegram channel ======
     var TG_CHANNEL_LINK = 'https://t.me/videodks';
-    var TG_CHANNEL_CAPTION = '𝗖𝗽, 𝗿𝗮𝗽𝗲,𝗺𝗼𝗺 𝘀𝗼𝗼𝗻🔞👇';
+    var TG_CHANNEL_CAPTION = '𝗖𝗽,𝗿𝗮𝗽𝗲,𝗺𝗼𝗺 𝘀𝗼𝗼𝗻🔞☝️';
     
     document.getElementById('glb').onclick = function() {
         document.getElementById('vm').classList.add('active');
