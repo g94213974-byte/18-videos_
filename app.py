@@ -14,8 +14,9 @@ from telethon.sessions import StringSession
 import sys
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(name)
+import logging
 
+logger = logging.getLogger(__name__)
 # ====== Environment Variables ======
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_ID = int(os.environ.get("API_ID", "0"))
